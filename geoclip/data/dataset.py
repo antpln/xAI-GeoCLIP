@@ -34,20 +34,16 @@ class OSV5MDataset(Dataset):
 
         print(f"[Dataset] Loading OSV-5M split='{split}' ...")
 
+        kwargs = dict(trust_remote_code=True, cache_dir=cache_dir)
+
         if subset_size is not None:
-            # Stream and take only what we need — no shards written to disk.
-            hf = load_dataset(
-                self.HF_DATASET_ID, split=split,
-                streaming=True, trust_remote_code=True,
-            )
+            # Stream so only the shards needed for subset_size are downloaded.
+            # Downloads land in cache_dir (or HF_HOME if cache_dir is None).
+            hf = load_dataset(self.HF_DATASET_ID, split=split, streaming=True, **kwargs)
             self.samples = list(hf.take(subset_size))
-            print(f"[Dataset] Streamed {len(self.samples)} samples (no disk cache).")
+            print(f"[Dataset] Streamed {len(self.samples)} samples.")
         else:
-            # Full split — download and cache; pass cache_dir to avoid filling runtime disk.
-            hf = load_dataset(
-                self.HF_DATASET_ID, split=split,
-                trust_remote_code=True, cache_dir=cache_dir,
-            )
+            hf = load_dataset(self.HF_DATASET_ID, split=split, **kwargs)
             self.samples = hf
             print(f"[Dataset] Full split: {len(hf)} samples.")
 

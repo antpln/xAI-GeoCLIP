@@ -87,6 +87,7 @@ class Trainer:
 
         for epoch in range(self.start_epoch, cfg.epochs):
             train_loss = self._train_epoch(epoch)
+            self._rotate_shard()
 
             if (epoch + 1) % cfg.eval_every == 0:
                 metrics = evaluate(
@@ -121,6 +122,21 @@ class Trainer:
                     filename=f"epoch_{epoch+1:03d}.pt",
                     is_best=is_best,
                 )
+
+    def _rotate_shard(self) -> None:
+        """If the training dataset supports shard rotation, advance to the next shard."""
+        dataset = self.train_loader.dataset
+        if not hasattr(dataset, "next_shard"):
+            return
+        dataset.next_shard()
+        self.train_loader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=self.train_loader.batch_size,
+            shuffle=True,
+            num_workers=self.train_loader.num_workers,
+            pin_memory=self.train_loader.pin_memory,
+        )
+        print(f"[Trainer] Shard rotated → {dataset.shard_progress}")
 
     def _train_epoch(self, epoch: int) -> float:
         self.model.train()
