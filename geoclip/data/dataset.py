@@ -28,33 +28,37 @@ class OSV5MDataset(Dataset):
         split: str = "train",
         subset_size: Optional[int] = None,
         transform: Optional[Callable] = None,
+        cache_dir: Optional[str] = None,
     ):
         from datasets import load_dataset
 
         print(f"[Dataset] Loading OSV-5M split='{split}' ...")
-        self.hf_dataset = load_dataset(
-            self.HF_DATASET_ID,
-            split=split,
-            trust_remote_code=True,
-        )
 
         if subset_size is not None:
-            n = min(subset_size, len(self.hf_dataset))
-            self.hf_dataset = self.hf_dataset.select(range(n))
-            print(f"[Dataset] Using subset of {n} samples.")
+            # Stream and take only what we need — no shards written to disk.
+            hf = load_dataset(
+                self.HF_DATASET_ID, split=split,
+                streaming=True, trust_remote_code=True,
+            )
+            self.samples = list(hf.take(subset_size))
+            print(f"[Dataset] Streamed {len(self.samples)} samples (no disk cache).")
         else:
-            print(f"[Dataset] Full split: {len(self.hf_dataset)} samples.")
+            # Full split — download and cache; pass cache_dir to avoid filling runtime disk.
+            hf = load_dataset(
+                self.HF_DATASET_ID, split=split,
+                trust_remote_code=True, cache_dir=cache_dir,
+            )
+            self.samples = hf
+            print(f"[Dataset] Full split: {len(hf)} samples.")
 
         self.transform = transform
-        # Keep a fallback index list to handle corrupted samples
-        self._valid_indices = list(range(len(self.hf_dataset)))
 
     def __len__(self) -> int:
-        return len(self.hf_dataset)
+        return len(self.samples)
 
     def __getitem__(self, idx: int):
         try:
-            item = self.hf_dataset[idx]
+            item = self.samples[idx]
             image: Image.Image = item["image"]
             if image.mode != "RGB":
                 image = image.convert("RGB")
