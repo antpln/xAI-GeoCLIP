@@ -158,7 +158,15 @@ class ShardedOSV5MDataset(Dataset):
         return os.path.join(self.hf_home, f"osv5m_shard_{idx:05d}")
 
     def _download(self, start_idx: int) -> Tuple[str, object]:
-        """Download shards_per_step files into an isolated cache dir and return the dataset."""
+        """Download shards_per_step files into an isolated cache dir and return the dataset.
+
+        Uses snapshot_download with allow_patterns so the HuggingFace Hub layer
+        physically fetches *only* the requested zip(s) before the loading script
+        runs. This is necessary because the OSV-5M loading script ignores the
+        data_files parameter during its download step and would otherwise pull all
+        98 shards (~490 GB).
+        """
+        from huggingface_hub import snapshot_download
         from datasets import load_dataset
 
         indices = [
@@ -170,27 +178,27 @@ class ShardedOSV5MDataset(Dataset):
 
         print(f"[ShardedDataset] Downloading shards {indices} → {os.path.basename(cache_dir)}")
 
-        try:
-            ds = load_dataset(
-                self.REPO_ID,
-                data_files={self.split: files},
-                split=self.split,
-                trust_remote_code=True,
-                cache_dir=cache_dir,
-            )
-        except Exception as e:
-            # data_files not supported by the loading script — fall back to streaming.
-            print(f"[ShardedDataset] data_files failed ({e}), using streaming fallback.")
-            hf = load_dataset(
-                self.REPO_ID, split=self.split,
-                streaming=True, trust_remote_code=True,
-            )
-            skip = start_idx * _SHARD_SIZE_ESTIMATE
-            take = self.shards_per_step * _SHARD_SIZE_ESTIMATE
-            ds = list(hf.skip(skip).take(take))
+        # Download only the target shard zip(s) plus repo metadata/scripts.
+        # snapshot_download enforces the pattern at the HTTP level, so no other
+        # shard zips are transferred regardless of what the loading script requests.
+        snapshot_download(
+            repo_id=self.REPO_ID,
+            repo_type="dataset",
+            allow_patterns=files + ["*.py", "*.json", "*.yaml", "*.yml", "*.md", "*.txt"],
+            local_dir=cache_dir,
+        )
 
-        n = len(ds)
-        print(f"[ShardedDataset] Ready: {n} samples in {os.path.basename(cache_dir)}")
+        # Load from the local snapshot. Pass data_files as absolute local paths so
+        # the loading script uses only the file(s) we just downloaded.
+        local_files = {self.split: [os.path.join(cache_dir, f) for f in files]}
+        ds = load_dataset(
+            cache_dir,
+            data_files=local_files,
+            split=self.split,
+            trust_remote_code=True,
+        )
+
+        print(f"[ShardedDataset] Ready: {len(ds)} samples in {os.path.basename(cache_dir)}")
         return cache_dir, ds
 
     def _worker(self, start_idx: int) -> None:
