@@ -1,0 +1,39 @@
+# Small experiment config for quick smoke testing
+model:
+  clip_backbone: "ViT-B/32"
+  freeze_layers: 11
+  rff_num_scales: 4
+  rff_dim: 64
+  mlp_hidden: 256
+  embedding_dim: 512
+
+data:
+  subset_size: 5000
+  streaming: false
+  num_workers: 2
+  pin_memory: true
+
+gallery:
+  size: 1000
+  strategy: "train_sample"
+  cache_path: "gallery_small.pt"
+
+training:
+  batch_size: 32
+  epochs: 5
+  warmup_epochs: 1
+  lr_clip: 1.0e-5
+  lr_gps: 1.0e-4
+  lr_temp: 1.0e-3
+  weight_decay: 0.1
+  amp: true
+  log_every: 10
+  eval_every: 1
+  checkpoint_dir: "checkpoints_small/"
+  hard_neg_swap_prob: 0.5
+  hard_neg_min_dist_km: 500.0
+  lambda_attn: 0.01
+  attn_reg_every: 4
+
+evaluation:
+  thresholds_km: [1, 25, 200, 750, 2500]

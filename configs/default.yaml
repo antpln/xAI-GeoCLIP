@@ -1,0 +1,41 @@
+# GeoCLIP default configuration
+model:
+  clip_backbone: "ViT-B/16"
+  freeze_layers: 9          # freeze first N of 12 transformer blocks
+  rff_num_scales: 10
+  rff_dim: 256              # random features per scale
+  mlp_hidden: 1024
+  embedding_dim: 512        # must match CLIP output dim
+
+data:
+  subset_size: 50000        # set to null for full dataset
+  streaming: false
+  num_workers: 4
+  pin_memory: true
+
+gallery:
+  size: 10000               # number of GPS points in retrieval gallery
+  strategy: "train_sample"  # "uniform" or "train_sample"
+  cache_path: "gallery.pt"
+
+training:
+  batch_size: 128
+  epochs: 30
+  warmup_epochs: 2
+  lr_clip: 1.0e-5
+  lr_gps: 1.0e-4
+  lr_temp: 1.0e-3
+  weight_decay: 0.1
+  amp: true
+  log_every: 50
+  eval_every: 1             # evaluate every N epochs
+  checkpoint_dir: "checkpoints/"
+  # Hard geographic negative mining
+  hard_neg_swap_prob: 0.5       # probability of injecting a hard negative per sample
+  hard_neg_min_dist_km: 500.0   # only pairs closer than this are considered hard
+  # Attention entropy regularization
+  lambda_attn: 0.01             # weight of entropy loss relative to InfoNCE
+  attn_reg_every: 4             # run every N steps (attention maps are memory-heavy)
+
+evaluation:
+  thresholds_km: [1, 25, 200, 750, 2500]

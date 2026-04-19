@@ -1,0 +1,187 @@
+"""
+Training loop for GeoCLIP.
+
+Combines InfoNCE with hard geographic negative mining as the primary loss,
+plus optional attention entropy regularization every few steps to encourage
+focused, interpretable attention maps.
+"""
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+import torch
+from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+
+from geoclip.losses.infonce import info_nce_loss
+from geoclip.losses.attention_entropy import attention_entropy_loss
+from geoclip.training.hard_negatives import info_nce_with_hard_negatives
+from geoclip.training.scheduler import get_cosine_schedule_with_warmup
+from geoclip.training.evaluator import evaluate
+from geoclip.utils.checkpoint import save_checkpoint, load_checkpoint
+from geoclip.utils.config import Config
+
+
+class Trainer:
+    """
+    Manages the full training loop for GeoCLIP.
+
+    Supports:
+    - Mixed precision (AMP) training
+    - Cosine LR schedule with linear warmup
+    - Separate LR for ViT backbone vs GPS encoder vs temperature
+    - Hard geographic negative mining (every step)
+    - Attention entropy regularization (every attn_reg_every steps)
+    - Gallery-based evaluation every N epochs
+    - Checkpoint saving (latest + best)
+    """
+
+    def __init__(
+        self,
+        model,
+        train_loader: DataLoader,
+        val_loader: DataLoader,
+        gallery_coords: torch.Tensor,
+        cfg: Config,
+        device: str = "cuda",
+        resume_path: Optional[str] = None,
+    ):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.gallery_coords = gallery_coords
+        self.cfg = cfg
+        self.device = device
+
+        self.optimizer = self._build_optimizer()
+        steps_per_epoch = len(train_loader)
+        total_steps = steps_per_epoch * cfg.training.epochs
+        warmup_steps = steps_per_epoch * cfg.training.warmup_epochs
+        self.scheduler = get_cosine_schedule_with_warmup(
+            self.optimizer, warmup_steps, total_steps
+        )
+
+        self.scaler = GradScaler(enabled=cfg.training.amp)
+        self.start_epoch = 0
+        self.best_median_gcd = float("inf")
+
+        if resume_path:
+            ckpt = load_checkpoint(resume_path, model, self.optimizer, self.scheduler, device)
+            self.start_epoch = ckpt.get("epoch", 0) + 1
+            self.best_median_gcd = ckpt.get("best_median_gcd", float("inf"))
+
+    def _build_optimizer(self) -> torch.optim.Optimizer:
+        cfg = self.cfg.training
+        param_groups = [
+            {"params": self.model.image_encoder.parameters(), "lr": cfg.lr_clip,  "name": "vit"},
+            {"params": self.model.gps_encoder.parameters(),   "lr": cfg.lr_gps,   "name": "gps"},
+            {"params": [self.model.log_logit_scale],           "lr": cfg.lr_temp,  "name": "temperature"},
+        ]
+        return torch.optim.AdamW(param_groups, weight_decay=cfg.weight_decay)
+
+    def train(self) -> None:
+        cfg = self.cfg.training
+        os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+        for epoch in range(self.start_epoch, cfg.epochs):
+            train_loss = self._train_epoch(epoch)
+
+            if (epoch + 1) % cfg.eval_every == 0:
+                metrics = evaluate(
+                    self.model,
+                    self.val_loader,
+                    self.gallery_coords,
+                    device=self.device,
+                    thresholds_km=self.cfg.evaluation.thresholds_km,
+                )
+                median_gcd = metrics["median_gcd_km"]
+                is_best = median_gcd < self.best_median_gcd
+                if is_best:
+                    self.best_median_gcd = median_gcd
+
+                print(
+                    f"[Epoch {epoch+1}/{cfg.epochs}] "
+                    f"loss={train_loss:.4f} | "
+                    + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
+                )
+
+                save_checkpoint(
+                    {
+                        "epoch": epoch,
+                        "train_loss": train_loss,
+                        "model_state": self.model.state_dict(),
+                        "optimizer_state": self.optimizer.state_dict(),
+                        "scheduler_state": self.scheduler.state_dict(),
+                        "best_median_gcd": self.best_median_gcd,
+                        "metrics": metrics,
+                    },
+                    checkpoint_dir=cfg.checkpoint_dir,
+                    filename=f"epoch_{epoch+1:03d}.pt",
+                    is_best=is_best,
+                )
+
+    def _train_epoch(self, epoch: int) -> float:
+        self.model.train()
+        total_loss = 0.0
+        cfg = self.cfg.training
+
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}", leave=False)
+        for step, (images, coords) in enumerate(pbar):
+            images = images.to(self.device)
+            coords = coords.to(self.device)
+
+            self.optimizer.zero_grad()
+
+            # Decide whether to run attention regularization this step.
+            # We do it every `attn_reg_every` steps to limit memory overhead
+            # (returning all attention maps requires storing L × [B, H, S, S] tensors).
+            use_attn_reg = (
+                cfg.lambda_attn > 0.0
+                and (step % cfg.attn_reg_every == 0)
+            )
+
+            with autocast(enabled=cfg.amp):
+                if use_attn_reg:
+                    img_emb, extras = self.model.image_encoder(
+                        images, output_attentions=True
+                    )
+                    gps_emb = self.model.encode_gps(coords)
+                    logit_scale = self.model.log_logit_scale.exp().clamp(max=100.0)
+                else:
+                    img_emb, gps_emb, logit_scale = self.model(images, coords)
+
+                # Primary loss: InfoNCE with hard geographic negatives
+                loss = info_nce_with_hard_negatives(
+                    img_emb, gps_emb, coords, logit_scale,
+                    swap_prob=cfg.hard_neg_swap_prob,
+                    min_distance_km=cfg.hard_neg_min_dist_km,
+                )
+
+                # Auxiliary loss: attention entropy regularization
+                if use_attn_reg:
+                    attn_loss = attention_entropy_loss(extras["attentions"], layer_idx=-1)
+                    loss = loss + cfg.lambda_attn * attn_loss
+
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            self.model.clamp_temperature()
+            self.scheduler.step()
+
+            total_loss += loss.item()
+
+            if (step + 1) % cfg.log_every == 0:
+                lr_vit = self.optimizer.param_groups[0]["lr"]
+                temp   = self.model.log_logit_scale.exp().item()
+                pbar.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    temp=f"{temp:.2f}",
+                    lr=f"{lr_vit:.2e}",
+                )
+
+        return total_loss / len(self.train_loader)
