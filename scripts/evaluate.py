@@ -3,10 +3,11 @@ Standalone evaluation script.
 
 Usage:
     python scripts/evaluate.py --checkpoint checkpoints/best.pt --config configs/default.yaml
+    python scripts/evaluate.py --checkpoint checkpoints/best.pt --hf_home /data/hf_cache
 """
 import argparse
-import sys
 import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,15 +30,26 @@ def main():
     parser.add_argument("--split", default="test")
     parser.add_argument("--subset_size", type=int, default=5000)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--hf_home", default=None,
+        help="Root directory for HuggingFace downloads (overrides HF_HOME env var).",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     device = args.device
 
+    hf_home = args.hf_home or os.environ.get("HF_HOME")
+    if hf_home:
+        os.makedirs(hf_home, exist_ok=True)
+        os.environ["HF_HOME"] = hf_home
+        print(f"[Eval] HF home: {hf_home}")
+
     dataset = OSV5MDataset(
         split=args.split,
         subset_size=args.subset_size,
         transform=get_eval_transform(),
+        cache_dir=hf_home,
     )
     loader = DataLoader(
         dataset,
@@ -72,8 +84,11 @@ def main():
     )
 
     print("\n=== Evaluation Results ===")
+    print(f"  Mean GCD:   {metrics['mean_gcd_km']:>8.1f} km")
+    print(f"  Median GCD: {metrics['median_gcd_km']:>8.1f} km")
     for k, v in metrics.items():
-        print(f"  {k}: {v:.4f}")
+        if k.startswith("recall"):
+            print(f"  {k}: {v * 100:.1f}%")
 
 
 if __name__ == "__main__":
