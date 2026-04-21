@@ -189,14 +189,17 @@ class ShardedOSV5MDataset(Dataset):
 
         # Iterate the tar(s) once to collect raw JPEG bytes + coordinates.
         # Storing bytes (not PIL images) keeps RAM usage minimal.
+        # Note: wds returns the JSON field as raw bytes — decode before use.
+        import json as _json
         samples: List[Tuple] = []
         for tar_path in tar_paths:
-            for jpg_bytes, meta in wds.WebDataset(tar_path).to_tuple("jpg", "json"):
+            for jpg_bytes, meta_bytes in wds.WebDataset(tar_path).to_tuple("jpg", "json"):
                 try:
+                    meta = _json.loads(meta_bytes)
                     lat = float(meta["latitude"])
                     lon = float(meta["longitude"])
                     samples.append((jpg_bytes, lat, lon))
-                except (KeyError, ValueError):
+                except (KeyError, ValueError, _json.JSONDecodeError):
                     continue
 
         print(f"[ShardedDataset] Ready: {len(samples)} samples")
@@ -284,8 +287,10 @@ class StreamingOSV5MDataset(IterableDataset):
             ds = ds.shuffle(self.shuffle_buffer)
         ds = ds.to_tuple("jpg", "json")
 
-        for jpg_bytes, meta in ds:
+        import json as _json
+        for jpg_bytes, meta_bytes in ds:
             try:
+                meta = _json.loads(meta_bytes)
                 image = Image.open(io.BytesIO(jpg_bytes)).convert("RGB")
                 lat = float(meta["latitude"])
                 lon = float(meta["longitude"])
