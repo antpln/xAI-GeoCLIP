@@ -9,7 +9,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, IterableDataset
 
 
 class ShardedOSV5MDataset(Dataset):
@@ -224,3 +224,81 @@ class ShardedOSV5MDataset(Dataset):
 
 
 _SHARD_SIZE_ESTIMATE = 51_000  # ~5 M samples / 98 shards
+
+
+class StreamingOSV5MDataset(IterableDataset):
+    """
+    OSV-5M via HuggingFace streaming — no pre-download, zero disk management.
+
+    Data is fetched lazily sample-by-sample directly from the Hub. Each
+    DataLoader worker receives a disjoint shard slice so there is no overlap.
+
+    Compared to ShardedOSV5MDataset:
+      - Pro: no disk usage, no shard rotation logic, simpler setup.
+      - Con: random-access shuffle is replaced by a bounded shuffle buffer;
+             throughput is bottlenecked by network + JPEG decode rather than
+             local I/O.  Use num_workers >= 4 and prefetch_factor=2 to hide
+             latency.
+
+    Small-file friction notes
+    -------------------------
+    OSV-5M stores individual JPEGs inside zip archives.  Sequential streaming
+    amortises zip-seek overhead well.  The dominant cost is JPEG decoding
+    (CPU-bound).  Recommendations for the DataLoader:
+        DataLoader(ds, num_workers=4, prefetch_factor=2, persistent_workers=True)
+    persistent_workers=True avoids re-spawning workers (and re-opening the HF
+    streaming connection) between epochs.
+
+    Args:
+        split:          "train" or "test".
+        transform:      torchvision transform applied to each PIL image.
+        shuffle_buffer: size of the in-memory shuffle reservoir (0 = no shuffle).
+        seed:           random seed for the shuffle buffer.
+        hf_home:        if set, overrides the HF_HOME environment variable.
+    """
+
+    REPO_ID = "osv5m/osv5m"
+
+    def __init__(
+        self,
+        split: str = "train",
+        transform: Optional[Callable] = None,
+        shuffle_buffer: int = 2048,
+        seed: int = 42,
+        hf_home: Optional[str] = None,
+    ):
+        self.split = split
+        self.transform = transform
+        self.shuffle_buffer = shuffle_buffer
+        self.seed = seed
+        if hf_home:
+            os.environ["HF_HOME"] = hf_home
+
+    def __iter__(self):
+        from datasets import load_dataset
+
+        worker_info = torch.utils.data.get_worker_info()
+
+        ds = load_dataset(
+            self.REPO_ID,
+            split=self.split,
+            streaming=True,
+            trust_remote_code=True,
+        )
+
+        if self.shuffle_buffer > 0:
+            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
+
+        # Distribute the underlying shard files across DataLoader workers so
+        # each worker iterates a disjoint subset — no duplicate samples.
+        if worker_info is not None:
+            ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+
+        for sample in ds:
+            img = sample["image"]  # PIL.Image decoded by the loading script
+            coords = torch.tensor(
+                [sample["latitude"], sample["longitude"]], dtype=torch.float32
+            )
+            if self.transform:
+                img = self.transform(img)
+            yield img, coords
