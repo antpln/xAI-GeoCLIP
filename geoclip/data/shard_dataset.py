@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import gc
+import io
 import os
 import queue
 import shutil
 import threading
-import zipfile
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -13,29 +13,51 @@ from PIL import Image
 from torch.utils.data import Dataset, IterableDataset
 
 
+# ---------------------------------------------------------------------------
+# Shard catalogue for osv5m/osv5m-wds
+# ---------------------------------------------------------------------------
+# Each tar shard contains {jpg, json} pairs.  Train shards are ~670 MB with
+# 10 000 samples; val and test shards are ~60–70 MB with 1 000 samples each.
+# These counts come from the sizes.json files in the repository.
+
+_SHARD_CATALOGUE = {
+    "train": {"n": 490, "per_shard": 10_000, "size_mb": 670},
+    "val":   {"n":  49, "per_shard":  1_000, "size_mb":  67},
+    "test":  {"n": 211, "per_shard":  1_000, "size_mb":  61},
+}
+
+_HF_BASE = "https://huggingface.co/datasets/osv5m/osv5m-wds/resolve/main"
+
+
 class ShardedOSV5MDataset(Dataset):
     """
-    Rotates OSV-5M shards with background prefetching.
+    Rotates osv5m-wds shards with background prefetching.
 
-    While one shard is being used for training, the next one is downloaded
-    in a background thread. Calling next_shard() blocks only if the prefetch
-    is not ready yet, then swaps atomically and deletes the old shard.
+    Uses the WebDataset (tar) version of OSV-5M instead of the zip-based
+    original.  Key improvements over the zip variant:
 
-    Each shard is downloaded into its own isolated cache directory so that
-    deleting a consumed shard never touches data still being downloaded.
+    - No custom loading script (no load_dataset, no RecursionError).
+    - Train shards are ~670 MB instead of ~5 GB — 7× smaller.
+    - Validation split exists and each shard is only ~67 MB.
+    - TAR format is sequential: hf_hub_download fetches the exact file
+      requested with a single HTTP request.
 
-    Disk usage: (shards_per_step + prefetch) * ~5 GB.
+    While one shard is training, the next is downloaded in a daemon thread.
+    Calling next_shard() blocks only if the prefetch is not ready yet, then
+    swaps and deletes the old directory.
+
+    Disk usage: (shards_per_step + prefetch) × shard_size_mb MB.
 
     Args:
-        split:           "train" or "test".
+        split:           "train", "val", or "test".
         transform:       torchvision transform applied to each image.
-        shards_per_step: number of shard files loaded per epoch (default 1).
-        prefetch:        number of future shards to download in the background.
-        hf_home:         HuggingFace home dir (defaults to HF_HOME env var).
-        start_shard:     index of the first shard to load.
+        shards_per_step: number of shard tars loaded per epoch (default 1).
+        prefetch:        number of future shards to download concurrently.
+        hf_home:         root dir for isolated shard caches.
+        start_shard:     index of the first shard (0-based).
     """
 
-    REPO_ID = "osv5m/osv5m"
+    REPO_ID = "osv5m/osv5m-wds"
 
     def __init__(
         self,
@@ -46,7 +68,8 @@ class ShardedOSV5MDataset(Dataset):
         hf_home: Optional[str] = None,
         start_shard: int = 0,
     ):
-        from huggingface_hub import list_repo_files
+        if split not in _SHARD_CATALOGUE:
+            raise ValueError(f"split must be one of {list(_SHARD_CATALOGUE)}, got '{split}'")
 
         self.split = split
         self.transform = transform
@@ -55,44 +78,28 @@ class ShardedOSV5MDataset(Dataset):
             "HF_HOME", os.path.expanduser("~/.cache/huggingface")
         )
 
-        print(f"[ShardedDataset] Discovering shards for split='{split}' ...")
-        all_files = list(list_repo_files(self.REPO_ID, repo_type="dataset"))
-
-        skip_exts = {".py", ".md", ".json", ".yaml", ".yml", ".txt", ".sh"}
-        self.shard_files = sorted([
-            f for f in all_files
-            if split in f.lower()
-            and os.path.splitext(f)[1] not in skip_exts
-            and not f.startswith(".")
-        ])
-
-        if not self.shard_files:
-            raise RuntimeError(f"No shard files found for split='{split}' in {self.REPO_ID}")
-
-        n = len(self.shard_files)
-        disk_gb = (shards_per_step + prefetch) * 5
+        cat = _SHARD_CATALOGUE[split]
+        self.n_shards = cat["n"]
+        size_mb = (shards_per_step + prefetch) * cat["size_mb"]
         print(
-            f"[ShardedDataset] {n} shards (~{n * 5} GB total). "
-            f"Disk usage: ~{disk_gb} GB "
-            f"({shards_per_step} active + {prefetch} prefetch)."
+            f"[ShardedDataset] {split}: {cat['n']} shards × "
+            f"~{cat['per_shard']} samples (~{cat['size_mb']} MB each). "
+            f"Active disk: ~{size_mb} MB."
         )
 
-        self._current_idx = start_shard % n
+        self._current_idx = start_shard % self.n_shards
         self._current_cache: Optional[str] = None
-        self._hf_dataset = None
+        self._samples: List[Tuple] = []
 
-        # Queue holds (hf_dataset, cache_dir) pairs ready for consumption.
         self._queue: queue.Queue = queue.Queue(maxsize=prefetch)
         self._stop = threading.Event()
 
-        # Load the first shard synchronously so the dataset is usable immediately.
-        cache, ds = self._download(self._current_idx)
+        cache, samples = self._download(self._current_idx)
         self._current_cache = cache
-        self._hf_dataset = ds
+        self._samples = samples
 
-        # Start background thread that prefetches subsequent shards.
         if prefetch > 0:
-            next_idx = (self._current_idx + shards_per_step) % n
+            next_idx = (self._current_idx + shards_per_step) % self.n_shards
             threading.Thread(
                 target=self._worker, args=(next_idx,), daemon=True
             ).start()
@@ -102,22 +109,14 @@ class ShardedOSV5MDataset(Dataset):
     # ------------------------------------------------------------------
 
     def next_shard(self) -> None:
-        """
-        Swap to the next shard. Blocks until the prefetch is ready, then
-        deletes the old shard's cache directory to free disk space.
-        """
+        """Block until the prefetched shard is ready, then rotate."""
         print("[ShardedDataset] Waiting for prefetched shard ...")
-        new_cache, new_ds = self._queue.get(block=True)
+        new_cache, new_samples = self._queue.get(block=True)
 
         old_cache = self._current_cache
-
-        # Close any open ZipFile handles pointing at the old cache before
-        # deleting the directory, so the OS can release the file descriptors.
-        self._close_zip_handles()
-
         self._current_cache = new_cache
-        self._hf_dataset = new_ds
-        self._current_idx = (self._current_idx + self.shards_per_step) % len(self.shard_files)
+        self._samples = new_samples
+        self._current_idx = (self._current_idx + self.shards_per_step) % self.n_shards
 
         if old_cache and os.path.exists(old_cache):
             shutil.rmtree(old_cache)
@@ -126,29 +125,24 @@ class ShardedOSV5MDataset(Dataset):
         gc.collect()
 
     def stop(self) -> None:
-        """Signal the background thread to exit cleanly."""
         self._stop.set()
 
     @property
     def shard_progress(self) -> str:
-        n = len(self.shard_files)
-        end = (self._current_idx + self.shards_per_step - 1) % n
-        return f"shards {self._current_idx}–{end} / {n}"
+        end = (self._current_idx + self.shards_per_step - 1) % self.n_shards
+        return f"shards {self._current_idx}–{end} / {self.n_shards}"
 
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        # _hf_dataset is a list of (zip_path, member_name, lat, lon) tuples.
-        return len(self._hf_dataset)
+        return len(self._samples)
 
     def __getitem__(self, idx: int):
-        zip_path, member_name, lat, lon = self._hf_dataset[idx]
+        jpg_bytes, lat, lon = self._samples[idx]
         try:
-            zf = self._get_zip(zip_path)
-            with zf.open(member_name) as f:
-                image = Image.open(f).convert("RGB")
+            image = Image.open(io.BytesIO(jpg_bytes)).convert("RGB")
             if self.transform is not None:
                 image = self.transform(image)
             return image, torch.tensor([lat, lon], dtype=torch.float32)
@@ -160,106 +154,74 @@ class ShardedOSV5MDataset(Dataset):
     # ------------------------------------------------------------------
 
     def _shard_cache_dir(self, idx: int) -> str:
-        return os.path.join(self.hf_home, f"osv5m_shard_{idx:05d}")
-
-    def _get_zip(self, path: str) -> zipfile.ZipFile:
-        """Return a cached ZipFile handle (one per process — safe for DataLoader workers)."""
-        if not hasattr(self, "_zip_handles"):
-            self._zip_handles: dict = {}
-        if path not in self._zip_handles:
-            self._zip_handles[path] = zipfile.ZipFile(path, "r")
-        return self._zip_handles[path]
-
-    def _close_zip_handles(self) -> None:
-        for zf in getattr(self, "_zip_handles", {}).values():
-            try:
-                zf.close()
-            except Exception:
-                pass
-        self._zip_handles = {}
+        return os.path.join(self.hf_home, f"osv5m_wds_{self.split}_{idx:05d}")
 
     def _download(self, start_idx: int) -> Tuple[str, List[Tuple]]:
-        """Download one shard zip + metadata CSV without touching the loading script.
+        """Download shards_per_step tar files and extract (jpg_bytes, lat, lon) tuples.
 
-        The OSV-5M loading script (osv5m.py) hardcodes all 98 shard URLs in
-        _split_generators and ignores the data_files parameter entirely, so any
-        path through load_dataset downloads the full ~490 GB.  We bypass it:
-
-          1. hf_hub_download fetches only the target zip(s) and the metadata CSV.
-          2. We parse the CSV with pandas and index by image ID.
-          3. We enumerate zip members and join with the metadata.
-          4. __getitem__ reads images directly from the ZipFile.
-
-        This gives exact shard isolation with no loading-script involvement.
+        hf_hub_download fetches a single named file — no loading script,
+        no recursive download, no ZIP central-directory HTTP range tricks.
+        Raw JPEG bytes are kept in memory; PIL decoding happens lazily in
+        __getitem__ so DataLoader workers can parallelise it.
         """
-        import pandas as pd
+        import webdataset as wds
         from huggingface_hub import hf_hub_download
 
         indices = [
-            (start_idx + i) % len(self.shard_files)
+            (start_idx + i) % self.n_shards
             for i in range(self.shards_per_step)
         ]
-        files = [self.shard_files[i] for i in indices]
         cache_dir = self._shard_cache_dir(start_idx)
         os.makedirs(cache_dir, exist_ok=True)
 
-        print(f"[ShardedDataset] Downloading shards {indices} → {os.path.basename(cache_dir)}")
+        print(f"[ShardedDataset] Downloading shards {indices}")
 
-        # Metadata CSV is small (~10 MB); cache it once in a shared directory.
-        meta_cache = os.path.join(self.hf_home, "meta")
-        meta_path = hf_hub_download(
-            repo_id=self.REPO_ID,
-            repo_type="dataset",
-            filename=f"{self.split}.csv",
-            local_dir=meta_cache,
-        )
-
-        # Download only the requested shard zip(s).
-        zip_paths = []
-        for fname in files:
-            zip_path = hf_hub_download(
+        tar_paths = []
+        for idx in indices:
+            fname = f"{self.split}/{idx:04d}.tar"
+            tar_path = hf_hub_download(
                 repo_id=self.REPO_ID,
                 repo_type="dataset",
                 filename=fname,
                 local_dir=cache_dir,
             )
-            zip_paths.append(zip_path)
+            tar_paths.append(tar_path)
 
-        # Build id → (lat, lon) lookup from the metadata CSV.
-        df = pd.read_csv(meta_path, dtype={"id": str},
-                         usecols=["id", "latitude", "longitude"])
-        meta = df.set_index("id")
-
-        # Build sample list: (zip_path, member_name, lat, lon).
-        # The loading script matches images by filename stem == row id.
-        img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+        # Iterate the tar(s) once to collect raw JPEG bytes + coordinates.
+        # Storing bytes (not PIL images) keeps RAM usage minimal.
         samples: List[Tuple] = []
-        for zip_path in zip_paths:
-            with zipfile.ZipFile(zip_path, "r") as zf:
-                for name in zf.namelist():
-                    if os.path.splitext(name)[1].lower() not in img_exts:
-                        continue
-                    img_id = os.path.splitext(os.path.basename(name))[0]
-                    if img_id not in meta.index:
-                        continue
-                    row = meta.loc[img_id]
-                    samples.append((zip_path, name, float(row["latitude"]), float(row["longitude"])))
+        for tar_path in tar_paths:
+            for jpg_bytes, meta in wds.WebDataset(tar_path).to_tuple("jpg", "json"):
+                try:
+                    lat = float(meta["latitude"])
+                    lon = float(meta["longitude"])
+                    samples.append((jpg_bytes, lat, lon))
+                except (KeyError, ValueError):
+                    continue
 
-        print(f"[ShardedDataset] Ready: {len(samples)} samples in {os.path.basename(cache_dir)}")
+        print(f"[ShardedDataset] Ready: {len(samples)} samples")
         return cache_dir, samples
 
     def _worker(self, start_idx: int) -> None:
-        """Background thread: continuously download shards and push to the queue."""
+        """Daemon thread: pre-download the next shard(s) and park in the queue."""
         idx = start_idx
         while not self._stop.is_set():
+            # Wait until there is space in the queue before downloading,
+            # so we never hold more than (prefetch) extra shards in memory.
+            while not self._stop.is_set():
+                if not self._queue.full():
+                    break
+                self._stop.wait(timeout=0.5)
+            if self._stop.is_set():
+                break
+
             try:
                 result = self._download(idx)
             except Exception as e:
                 print(f"[ShardedDataset] Prefetch error shard {idx}: {e}")
-                idx = (idx + self.shards_per_step) % len(self.shard_files)
+                idx = (idx + self.shards_per_step) % self.n_shards
                 continue
 
-            # Push to queue; retry with timeout so the stop event is checked.
             while not self._stop.is_set():
                 try:
                     self._queue.put(result, timeout=1)
@@ -267,89 +229,68 @@ class ShardedOSV5MDataset(Dataset):
                 except queue.Full:
                     continue
 
-            idx = (idx + self.shards_per_step) % len(self.shard_files)
-
-
-_SHARD_SIZE_ESTIMATE = 51_000  # ~5 M samples / 98 shards
+            idx = (idx + self.shards_per_step) % self.n_shards
 
 
 class StreamingOSV5MDataset(IterableDataset):
     """
-    OSV-5M via HuggingFace streaming — no pre-download, zero disk management.
+    OSV-5M (wds) via WebDataset streaming — no pre-download, zero disk usage.
 
-    Data is fetched lazily sample-by-sample directly from the Hub. Each
-    DataLoader worker receives a disjoint shard slice so there is no overlap.
+    Streams tar shards directly from the HuggingFace Hub using the webdataset
+    library.  Unlike the zip-based HF streaming loader, WebDataset tars are
+    sequential so there are no HTTP range-request penalties.
 
-    Compared to ShardedOSV5MDataset:
-      - Pro: no disk usage, no shard rotation logic, simpler setup.
-      - Con: random-access shuffle is replaced by a bounded shuffle buffer;
-             throughput is bottlenecked by network + JPEG decode rather than
-             local I/O.  Use num_workers >= 4 and prefetch_factor=2 to hide
-             latency.
+    Works correctly with num_workers > 0: webdataset distributes shards
+    across DataLoader workers automatically (each worker gets a disjoint
+    subset of shards).
 
-    DataLoader requirements
-    -----------------------
-    MUST use num_workers=0.  HuggingFace streaming internally uses
-    requests.Session objects that are not fork-safe; any num_workers > 0
-    will deadlock on Colab (and most Linux environments that use fork).
-    Network I/O releases the GIL so a single worker is not as slow as it
-    sounds — the bottleneck is bandwidth, not the Python thread.
-
-        DataLoader(ds, num_workers=0, pin_memory=True)
+        DataLoader(ds, num_workers=4, prefetch_factor=2)
 
     Args:
-        split:          "train" or "test".
+        split:          "train", "val", or "test".
         transform:      torchvision transform applied to each PIL image.
-        shuffle_buffer: size of the in-memory shuffle reservoir (0 = no shuffle).
-        seed:           random seed for the shuffle buffer.
-        hf_home:        if set, overrides the HF_HOME environment variable.
+        shuffle_buffer: in-memory reservoir size for shuffling (0 = no shuffle).
+        shardshuffle:   whether to shuffle shard order (default True for train).
+        hf_home:        unused (kept for API compatibility with ShardedOSV5MDataset).
     """
 
-    REPO_ID = "osv5m/osv5m"
+    REPO_ID = "osv5m/osv5m-wds"
 
     def __init__(
         self,
         split: str = "train",
         transform: Optional[Callable] = None,
-        shuffle_buffer: int = 2048,
-        seed: int = 42,
-        hf_home: Optional[str] = None,
+        shuffle_buffer: int = 1000,
+        shardshuffle: bool = True,
+        hf_home: Optional[str] = None,  # kept for API compat
     ):
+        if split not in _SHARD_CATALOGUE:
+            raise ValueError(f"split must be one of {list(_SHARD_CATALOGUE)}, got '{split}'")
         self.split = split
         self.transform = transform
         self.shuffle_buffer = shuffle_buffer
-        self.seed = seed
-        if hf_home:
-            os.environ["HF_HOME"] = hf_home
+        self.shardshuffle = shardshuffle
 
     def __iter__(self):
-        from datasets import load_dataset
+        import webdataset as wds
 
-        # Guard: warn if called from a DataLoader worker.  HF streaming is not
-        # fork-safe; the caller must use num_workers=0.
-        worker_info = torch.utils.data.get_worker_info()
-        if worker_info is not None:
-            raise RuntimeError(
-                "StreamingOSV5MDataset is not compatible with num_workers > 0. "
-                "HuggingFace streaming uses requests.Session which is not fork-safe. "
-                "Use DataLoader(..., num_workers=0)."
-            )
+        cat = _SHARD_CATALOGUE[self.split]
+        n = cat["n"]
+        # WebDataset brace expansion: {0000..0489}
+        url = f"{_HF_BASE}/{self.split}/{{{0:04d}..{n - 1:04d}}}.tar"
 
-        ds = load_dataset(
-            self.REPO_ID,
-            split=self.split,
-            streaming=True,
-            trust_remote_code=True,
-        )
-
+        ds = wds.WebDataset(url, shardshuffle=self.shardshuffle)
         if self.shuffle_buffer > 0:
-            ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
+            ds = ds.shuffle(self.shuffle_buffer)
+        ds = ds.to_tuple("jpg", "json")
 
-        for sample in ds:
-            img = sample["image"]  # PIL.Image decoded by the loading script
-            coords = torch.tensor(
-                [sample["latitude"], sample["longitude"]], dtype=torch.float32
-            )
+        for jpg_bytes, meta in ds:
+            try:
+                image = Image.open(io.BytesIO(jpg_bytes)).convert("RGB")
+                lat = float(meta["latitude"])
+                lon = float(meta["longitude"])
+            except Exception:
+                continue
             if self.transform:
-                img = self.transform(img)
-            yield img, coords
+                image = self.transform(image)
+            yield image, torch.tensor([lat, lon], dtype=torch.float32)
