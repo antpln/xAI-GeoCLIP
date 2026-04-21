@@ -5,7 +5,8 @@ import os
 import queue
 import shutil
 import threading
-from typing import Callable, Optional, Tuple
+import zipfile
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -109,6 +110,11 @@ class ShardedOSV5MDataset(Dataset):
         new_cache, new_ds = self._queue.get(block=True)
 
         old_cache = self._current_cache
+
+        # Close any open ZipFile handles pointing at the old cache before
+        # deleting the directory, so the OS can release the file descriptors.
+        self._close_zip_handles()
+
         self._current_cache = new_cache
         self._hf_dataset = new_ds
         self._current_idx = (self._current_idx + self.shards_per_step) % len(self.shard_files)
@@ -134,16 +140,15 @@ class ShardedOSV5MDataset(Dataset):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
+        # _hf_dataset is a list of (zip_path, member_name, lat, lon) tuples.
         return len(self._hf_dataset)
 
     def __getitem__(self, idx: int):
+        zip_path, member_name, lat, lon = self._hf_dataset[idx]
         try:
-            item = self._hf_dataset[idx]
-            image: Image.Image = item["image"]
-            if image.mode != "RGB":
-                image = image.convert("RGB")
-            lat = float(item["latitude"])
-            lon = float(item["longitude"])
+            zf = self._get_zip(zip_path)
+            with zf.open(member_name) as f:
+                image = Image.open(f).convert("RGB")
             if self.transform is not None:
                 image = self.transform(image)
             return image, torch.tensor([lat, lon], dtype=torch.float32)
@@ -157,17 +162,38 @@ class ShardedOSV5MDataset(Dataset):
     def _shard_cache_dir(self, idx: int) -> str:
         return os.path.join(self.hf_home, f"osv5m_shard_{idx:05d}")
 
-    def _download(self, start_idx: int) -> Tuple[str, object]:
-        """Download shards_per_step files into an isolated cache dir and return the dataset.
+    def _get_zip(self, path: str) -> zipfile.ZipFile:
+        """Return a cached ZipFile handle (one per process — safe for DataLoader workers)."""
+        if not hasattr(self, "_zip_handles"):
+            self._zip_handles: dict = {}
+        if path not in self._zip_handles:
+            self._zip_handles[path] = zipfile.ZipFile(path, "r")
+        return self._zip_handles[path]
 
-        Uses snapshot_download with allow_patterns so the HuggingFace Hub layer
-        physically fetches *only* the requested zip(s) before the loading script
-        runs. This is necessary because the OSV-5M loading script ignores the
-        data_files parameter during its download step and would otherwise pull all
-        98 shards (~490 GB).
+    def _close_zip_handles(self) -> None:
+        for zf in getattr(self, "_zip_handles", {}).values():
+            try:
+                zf.close()
+            except Exception:
+                pass
+        self._zip_handles = {}
+
+    def _download(self, start_idx: int) -> Tuple[str, List[Tuple]]:
+        """Download one shard zip + metadata CSV without touching the loading script.
+
+        The OSV-5M loading script (osv5m.py) hardcodes all 98 shard URLs in
+        _split_generators and ignores the data_files parameter entirely, so any
+        path through load_dataset downloads the full ~490 GB.  We bypass it:
+
+          1. hf_hub_download fetches only the target zip(s) and the metadata CSV.
+          2. We parse the CSV with pandas and index by image ID.
+          3. We enumerate zip members and join with the metadata.
+          4. __getitem__ reads images directly from the ZipFile.
+
+        This gives exact shard isolation with no loading-script involvement.
         """
-        from huggingface_hub import snapshot_download
-        from datasets import load_dataset
+        import pandas as pd
+        from huggingface_hub import hf_hub_download
 
         indices = [
             (start_idx + i) % len(self.shard_files)
@@ -175,31 +201,52 @@ class ShardedOSV5MDataset(Dataset):
         ]
         files = [self.shard_files[i] for i in indices]
         cache_dir = self._shard_cache_dir(start_idx)
+        os.makedirs(cache_dir, exist_ok=True)
 
         print(f"[ShardedDataset] Downloading shards {indices} → {os.path.basename(cache_dir)}")
 
-        # Download only the target shard zip(s) plus repo metadata/scripts.
-        # snapshot_download enforces the pattern at the HTTP level, so no other
-        # shard zips are transferred regardless of what the loading script requests.
-        snapshot_download(
+        # Metadata CSV is small (~10 MB); cache it once in a shared directory.
+        meta_cache = os.path.join(self.hf_home, "meta")
+        meta_path = hf_hub_download(
             repo_id=self.REPO_ID,
             repo_type="dataset",
-            allow_patterns=files + ["*.py", "*.json", "*.yaml", "*.yml", "*.md", "*.txt"],
-            local_dir=cache_dir,
+            filename=f"{self.split}.csv",
+            local_dir=meta_cache,
         )
 
-        # Load from the local snapshot. Pass data_files as absolute local paths so
-        # the loading script uses only the file(s) we just downloaded.
-        local_files = {self.split: [os.path.join(cache_dir, f) for f in files]}
-        ds = load_dataset(
-            cache_dir,
-            data_files=local_files,
-            split=self.split,
-            trust_remote_code=True,
-        )
+        # Download only the requested shard zip(s).
+        zip_paths = []
+        for fname in files:
+            zip_path = hf_hub_download(
+                repo_id=self.REPO_ID,
+                repo_type="dataset",
+                filename=fname,
+                local_dir=cache_dir,
+            )
+            zip_paths.append(zip_path)
 
-        print(f"[ShardedDataset] Ready: {len(ds)} samples in {os.path.basename(cache_dir)}")
-        return cache_dir, ds
+        # Build id → (lat, lon) lookup from the metadata CSV.
+        df = pd.read_csv(meta_path, dtype={"id": str},
+                         usecols=["id", "latitude", "longitude"])
+        meta = df.set_index("id")
+
+        # Build sample list: (zip_path, member_name, lat, lon).
+        # The loading script matches images by filename stem == row id.
+        img_exts = {".jpg", ".jpeg", ".png", ".webp"}
+        samples: List[Tuple] = []
+        for zip_path in zip_paths:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                for name in zf.namelist():
+                    if os.path.splitext(name)[1].lower() not in img_exts:
+                        continue
+                    img_id = os.path.splitext(os.path.basename(name))[0]
+                    if img_id not in meta.index:
+                        continue
+                    row = meta.loc[img_id]
+                    samples.append((zip_path, name, float(row["latitude"]), float(row["longitude"])))
+
+        print(f"[ShardedDataset] Ready: {len(samples)} samples in {os.path.basename(cache_dir)}")
+        return cache_dir, samples
 
     def _worker(self, start_idx: int) -> None:
         """Background thread: continuously download shards and push to the queue."""
@@ -240,14 +287,15 @@ class StreamingOSV5MDataset(IterableDataset):
              local I/O.  Use num_workers >= 4 and prefetch_factor=2 to hide
              latency.
 
-    Small-file friction notes
-    -------------------------
-    OSV-5M stores individual JPEGs inside zip archives.  Sequential streaming
-    amortises zip-seek overhead well.  The dominant cost is JPEG decoding
-    (CPU-bound).  Recommendations for the DataLoader:
-        DataLoader(ds, num_workers=4, prefetch_factor=2, persistent_workers=True)
-    persistent_workers=True avoids re-spawning workers (and re-opening the HF
-    streaming connection) between epochs.
+    DataLoader requirements
+    -----------------------
+    MUST use num_workers=0.  HuggingFace streaming internally uses
+    requests.Session objects that are not fork-safe; any num_workers > 0
+    will deadlock on Colab (and most Linux environments that use fork).
+    Network I/O releases the GIL so a single worker is not as slow as it
+    sounds — the bottleneck is bandwidth, not the Python thread.
+
+        DataLoader(ds, num_workers=0, pin_memory=True)
 
     Args:
         split:          "train" or "test".
@@ -277,7 +325,15 @@ class StreamingOSV5MDataset(IterableDataset):
     def __iter__(self):
         from datasets import load_dataset
 
+        # Guard: warn if called from a DataLoader worker.  HF streaming is not
+        # fork-safe; the caller must use num_workers=0.
         worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            raise RuntimeError(
+                "StreamingOSV5MDataset is not compatible with num_workers > 0. "
+                "HuggingFace streaming uses requests.Session which is not fork-safe. "
+                "Use DataLoader(..., num_workers=0)."
+            )
 
         ds = load_dataset(
             self.REPO_ID,
@@ -288,11 +344,6 @@ class StreamingOSV5MDataset(IterableDataset):
 
         if self.shuffle_buffer > 0:
             ds = ds.shuffle(buffer_size=self.shuffle_buffer, seed=self.seed)
-
-        # Distribute the underlying shard files across DataLoader workers so
-        # each worker iterates a disjoint subset — no duplicate samples.
-        if worker_info is not None:
-            ds = ds.shard(num_shards=worker_info.num_workers, index=worker_info.id)
 
         for sample in ds:
             img = sample["image"]  # PIL.Image decoded by the loading script
