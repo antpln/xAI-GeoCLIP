@@ -64,6 +64,7 @@ class ShardedOSV5MDataset(Dataset):
         split: str = "train",
         transform: Optional[Callable] = None,
         shards_per_step: int = 1,
+        num_shards: Optional[int] = None,
         prefetch: int = 1,
         hf_home: Optional[str] = None,
         start_shard: int = 0,
@@ -79,10 +80,10 @@ class ShardedOSV5MDataset(Dataset):
         )
 
         cat = _SHARD_CATALOGUE[split]
-        self.n_shards = cat["n"]
+        self.n_shards = num_shards if num_shards is not None else cat["n"]
         size_mb = (shards_per_step + prefetch) * cat["size_mb"]
         print(
-            f"[ShardedDataset] {split}: {cat['n']} shards × "
+            f"[ShardedDataset] {split}: {self.n_shards} shards used (max {cat['n']}) × "
             f"~{cat['per_shard']} samples (~{cat['size_mb']} MB each). "
             f"Active disk: ~{size_mb} MB."
         )
@@ -263,6 +264,7 @@ class StreamingOSV5MDataset(IterableDataset):
         self,
         split: str = "train",
         transform: Optional[Callable] = None,
+        num_shards: Optional[int] = None,
         shuffle_buffer: int = 1000,
         shardshuffle: bool = True,
         hf_home: Optional[str] = None,  # kept for API compat
@@ -271,6 +273,7 @@ class StreamingOSV5MDataset(IterableDataset):
             raise ValueError(f"split must be one of {list(_SHARD_CATALOGUE)}, got '{split}'")
         self.split = split
         self.transform = transform
+        self.num_shards = num_shards
         self.shuffle_buffer = shuffle_buffer
         self.shardshuffle = shardshuffle
 
@@ -278,7 +281,7 @@ class StreamingOSV5MDataset(IterableDataset):
         import webdataset as wds
 
         cat = _SHARD_CATALOGUE[self.split]
-        n = cat["n"]
+        n = self.num_shards if self.num_shards is not None else cat["n"]
         # WebDataset brace expansion: {0000..0489}
         url = f"{_HF_BASE}/{self.split}/{{{0:04d}..{n - 1:04d}}}.tar"
 

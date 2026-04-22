@@ -36,16 +36,25 @@ class OSV5MDataset(Dataset):
 
         kwargs = dict(trust_remote_code=True, cache_dir=cache_dir)
 
-        if subset_size is not None:
-            # Stream so only the shards needed for subset_size are downloaded.
-            # Downloads land in cache_dir (or HF_HOME if cache_dir is None).
-            hf = load_dataset(self.HF_DATASET_ID, split=split, streaming=True, **kwargs)
-            self.samples = list(hf.take(subset_size))
-            print(f"[Dataset] Streamed {len(self.samples)} samples.")
-        else:
-            hf = load_dataset(self.HF_DATASET_ID, split=split, **kwargs)
-            self.samples = hf
-            print(f"[Dataset] Full split: {len(hf)} samples.")
+        try:
+            # First, try to load from local storage to avoid any network check/download
+            hf = load_dataset(self.HF_DATASET_ID, split=split, local_files_only=True, **kwargs)
+            if subset_size is not None:
+                self.samples = hf.select(range(min(subset_size, len(hf))))
+                print(f"[Dataset] Loaded {len(self.samples)} samples from local storage.")
+            else:
+                self.samples = hf
+                print(f"[Dataset] Loaded full split ({len(hf)} samples) from local storage.")
+        except Exception:
+            # Fallback to normal loading (streaming for subsets, download for full) if not found locally
+            if subset_size is not None:
+                hf = load_dataset(self.HF_DATASET_ID, split=split, streaming=True, **kwargs)
+                self.samples = list(hf.take(subset_size))
+                print(f"[Dataset] Streamed {len(self.samples)} samples (local storage not found).")
+            else:
+                hf = load_dataset(self.HF_DATASET_ID, split=split, **kwargs)
+                self.samples = hf
+                print(f"[Dataset] Full split: {len(hf)} samples.")
 
         self.transform = transform
 
