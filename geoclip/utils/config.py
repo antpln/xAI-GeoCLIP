@@ -16,6 +16,7 @@ class ModelConfig:
 @dataclass
 class DataConfig:
     subset_size: Optional[int] = 50000
+    num_shards: Optional[int] = None
     streaming: bool = False
     num_workers: int = 4
     pin_memory: bool = True
