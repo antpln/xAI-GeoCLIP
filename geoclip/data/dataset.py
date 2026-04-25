@@ -29,6 +29,7 @@ class OSV5MDataset(Dataset):
         subset_size: Optional[int] = None,
         transform: Optional[Callable] = None,
         cache_dir: Optional[str] = None,
+        local_files_only: bool = False,
     ):
         from datasets import load_dataset
 
@@ -45,7 +46,10 @@ class OSV5MDataset(Dataset):
             else:
                 self.samples = hf
                 print(f"[Dataset] Loaded full split ({len(hf)} samples) from local storage.")
-        except Exception:
+        except Exception as e:
+            if local_files_only:
+                raise RuntimeError(f"local_files_only=True but dataset not found locally: {e}")
+
             # Fallback to normal loading (streaming for subsets, download for full) if not found locally
             if subset_size is not None:
                 hf = load_dataset(self.HF_DATASET_ID, split=split, streaming=True, **kwargs)

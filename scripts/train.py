@@ -46,6 +46,10 @@ def main():
             "sharded  — rotating wds shards with background prefetch"
         ),
     )
+    parser.add_argument(
+        "--local_files_only", action="store_true",
+        help="Only load dataset from local storage, fail if not found.",
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -67,6 +71,7 @@ def main():
             subset_size=cfg.data.subset_size,
             transform=get_train_transform(),
             cache_dir=hf_home,
+            local_files_only=args.local_files_only,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.training.batch_size,
@@ -80,6 +85,7 @@ def main():
             subset_size=cfg.data.subset_size,
             transform=get_train_transform(),
             cache_dir=hf_home,
+            local_files_only=args.local_files_only,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.training.batch_size,
@@ -90,6 +96,7 @@ def main():
     elif args.dataset_mode == "streaming":
         train_dataset = StreamingOSV5MDataset(
             split="train",
+            num_shards=cfg.data.num_shards,
             transform=get_train_transform(),
             shuffle_buffer=4096,
             hf_home=hf_home,
@@ -104,6 +111,7 @@ def main():
     else:  # sharded
         train_dataset = ShardedOSV5MDataset(
             split="train",
+            num_shards=cfg.data.num_shards,
             transform=get_train_transform(),
             shards_per_step=1,
             hf_home=hf_home,
@@ -120,6 +128,7 @@ def main():
         subset_size=min(cfg.data.subset_size or 5000, 5000),
         transform=get_eval_transform(),
         cache_dir=hf_home,
+        local_files_only=args.local_files_only,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=cfg.training.batch_size,
