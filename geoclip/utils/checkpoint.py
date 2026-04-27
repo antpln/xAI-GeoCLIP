@@ -3,6 +3,32 @@ import torch
 from typing import Optional
 
 
+def load_pretrained_geoclip_weights(model, weights_dir: str, device: str = "cpu") -> None:
+    """
+    Warm-start a GeoCLIP model from the original GeoCLIP pre-trained weights.
+    skip gps_encoder because architectures are incompatible.
+    """
+    # --- logit scale ---
+    ls_path = os.path.join(weights_dir, "logit_scale_weights.pth")
+    ls = torch.load(ls_path, map_location=device)
+    with torch.no_grad():
+        model.log_logit_scale.copy_(ls)
+    print(f"[Pretrained] Loaded logit_scale = {ls.item():.4f} (exp={ls.exp().item():.2f})")
+
+    # --- image encoder projection head ---
+    proj_path = os.path.join(weights_dir, "image_encoder_mlp_weights.pth")
+    proj_weights = torch.load(proj_path, map_location=device)
+    proj = model.image_encoder.projection
+    # original Sequential: Linear(768,768)[0] -> act[1] -> Linear(768,512)[2]
+    # our Sequential:      Linear(768,768)[0] -> GELU[1] -> LayerNorm[2] -> Linear(768,512)[3]
+    with torch.no_grad():
+        proj[0].weight.copy_(proj_weights["0.weight"])
+        proj[0].bias.copy_(proj_weights["0.bias"])
+        proj[3].weight.copy_(proj_weights["2.weight"])
+        proj[3].bias.copy_(proj_weights["2.bias"])
+    print("[Pretrained] Loaded image_encoder projection head (layers 0 and 3).")
+
+
 def save_checkpoint(
     state: dict,
     checkpoint_dir: str,

@@ -20,7 +20,7 @@ from geoclip.losses.attention_entropy import attention_entropy_loss
 from geoclip.training.hard_negatives import info_nce_with_hard_negatives
 from geoclip.training.scheduler import get_cosine_schedule_with_warmup
 from geoclip.training.evaluator import evaluate
-from geoclip.utils.checkpoint import save_checkpoint, load_checkpoint
+from geoclip.utils.checkpoint import save_checkpoint, load_checkpoint, load_pretrained_geoclip_weights
 from geoclip.utils.config import Config
 
 
@@ -54,6 +54,9 @@ class Trainer:
         self.gallery_coords = gallery_coords
         self.cfg = cfg
         self.device = device
+
+        if cfg.training.pretrained_weights_dir:
+            load_pretrained_geoclip_weights(model, cfg.training.pretrained_weights_dir, device)
 
         self.optimizer = self._build_optimizer()
         steps_per_epoch = len(train_loader)

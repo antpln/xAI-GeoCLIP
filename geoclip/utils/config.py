@@ -31,6 +31,7 @@ class GalleryConfig:
 
 @dataclass
 class TrainingConfig:
+    pretrained_weights_dir: Optional[str] = None  # path to pre_trained_weights folder; None = skip
     batch_size: int = 128
     epochs: int = 30
     warmup_epochs: int = 2
