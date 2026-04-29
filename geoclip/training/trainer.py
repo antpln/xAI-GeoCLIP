@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from geoclip.losses.infonce import info_nce_loss
@@ -66,7 +66,7 @@ class Trainer:
             self.optimizer, warmup_steps, total_steps
         )
 
-        self.scaler = GradScaler(enabled=cfg.training.amp)
+        self.scaler = GradScaler("cuda", enabled=cfg.training.amp)
         self.start_epoch = 0
         self.best_median_gcd = float("inf")
 
@@ -87,6 +87,8 @@ class Trainer:
     def train(self) -> None:
         cfg = self.cfg.training
         os.makedirs(cfg.checkpoint_dir, exist_ok=True)
+
+        history: list[dict] = []
 
         for epoch in range(self.start_epoch, cfg.epochs):
             train_loss = self._train_epoch(epoch)
@@ -111,6 +113,9 @@ class Trainer:
                     + " | ".join(f"{k}={v:.4f}" for k, v in metrics.items())
                 )
 
+                history.append({"epoch": epoch + 1, "loss": train_loss, **metrics})
+                self._save_figures(history, cfg.checkpoint_dir)
+
                 save_checkpoint(
                     {
                         "epoch": epoch,
@@ -125,6 +130,37 @@ class Trainer:
                     filename=f"epoch_{epoch+1:03d}.pt",
                     is_best=is_best,
                 )
+
+    def _save_figures(self, history: list[dict], checkpoint_dir: str) -> None:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            return
+
+        epochs = [h["epoch"] for h in history]
+        acc_keys = [k for k in history[0] if k.startswith("recall@")]
+
+        fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+        axes[0].plot(epochs, [h["loss"] for h in history], marker="o")
+        axes[0].set(title="Train loss", xlabel="Epoch", ylabel="Loss")
+        axes[0].grid(True)
+
+        for k in acc_keys:
+            axes[1].plot(epochs, [h[k] for h in history], marker="o", label=k)
+        axes[1].set(title="Accuracy @ thresholds", xlabel="Epoch", ylabel="Accuracy")
+        axes[1].legend(fontsize=8)
+        axes[1].grid(True)
+
+        axes[2].plot(epochs, [h["median_gcd_km"] for h in history], marker="o", color="tab:red")
+        axes[2].set(title="Median GCD (km)", xlabel="Epoch", ylabel="km")
+        axes[2].grid(True)
+
+        fig.tight_layout()
+        fig.savefig(os.path.join(checkpoint_dir, "training_curves.png"), dpi=120)
+        plt.close(fig)
 
     def _rotate_shard(self) -> None:
         """If the training dataset supports shard rotation, advance to the next shard."""
@@ -161,7 +197,7 @@ class Trainer:
                 and (step % cfg.attn_reg_every == 0)
             )
 
-            with autocast(enabled=cfg.amp):
+            with autocast("cuda", enabled=cfg.amp):
                 if use_attn_reg:
                     img_emb, extras = self.model.image_encoder(
                         images, output_attentions=True
@@ -186,11 +222,13 @@ class Trainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            scale_before = self.scaler.get_scale()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
             self.model.clamp_temperature()
-            self.scheduler.step()
+            if self.scaler.get_scale() >= scale_before:
+                self.scheduler.step()
 
             total_loss += loss.item()
 

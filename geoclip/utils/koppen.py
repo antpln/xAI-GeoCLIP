@@ -7,10 +7,11 @@ extra runtime dependencies beyond numpy and urllib.
 """
 from __future__ import annotations
 
+import csv
 import os
 import urllib.request
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 
@@ -74,27 +75,52 @@ CLASS_COLORS: list[str] = [
 # The file is ~0.5 MB and is served directly from the authors' supplement.
 _DEFAULT_CACHE = Path.home() / ".cache" / "koppen_0p5.npy"
 
-# Primary source: pre-converted .npy hosted on GitHub (small, fast)
-_NPY_URL = (
-    "https://github.com/hylken/koppen-geiger/raw/main/koppen_0p5.npy"
-)
+# Candidate sources tried in order
+_NPY_URLS = [
+    "https://github.com/hylken/koppen-geiger/raw/main/koppen_0p5.npy",
+]
 
-# Fallback: download the original GeoTIFF and convert on the fly
-# (requires tifffile, a pure-python package)
-_TIFF_URL = (
-    "https://figshare.com/ndownloader/files/12407516"  # Beck et al. 0.5° tiff
-)
+# Beck et al. (2018) 0.5° GeoTIFF via Figshare — converted on the fly with tifffile
+_TIFF_URL = "https://figshare.com/ndownloader/files/12407516"
 
 
 def _download_npy(cache_path: Path) -> np.ndarray:
-    """Download the 0.5° Köppen raster as a uint8 numpy array."""
+    """Try candidate URLs in order, falling back to the Figshare TIFF if needed."""
     cache_path.parent.mkdir(parents=True, exist_ok=True)
     tmp = str(cache_path) + ".tmp"
 
+    # 1. Try pre-built .npy files
+    for url in _NPY_URLS:
+        try:
+            print(f"[Koppen] Trying {url} …")
+            urllib.request.urlretrieve(url, tmp)
+            arr = np.load(tmp)
+            np.save(cache_path, arr)
+            os.remove(tmp)
+            print(f"[Koppen] Cached to {cache_path}  shape={arr.shape}")
+            return arr
+        except Exception as e:
+            print(f"[Koppen] Failed ({e}), trying next source …")
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
+    # 2. Fallback: download Beck et al. GeoTIFF and convert with tifffile
     try:
-        print(f"[Koppen] Downloading Köppen raster from {_NPY_URL} …")
-        urllib.request.urlretrieve(_NPY_URL, tmp)
-        arr = np.load(tmp)
+        import tifffile
+    except ImportError:
+        raise RuntimeError(
+            "All .npy sources failed and tifffile is not installed.\n"
+            "Install it with:  pip install tifffile\n"
+            "Or manually save a 0.5° uint8 numpy grid (360×720) to:\n"
+            f"  {cache_path}"
+        )
+
+    try:
+        print(f"[Koppen] Downloading Beck et al. GeoTIFF from Figshare …")
+        urllib.request.urlretrieve(_TIFF_URL, tmp)
+        arr = tifffile.imread(tmp).astype(np.uint8)
+        if arr.ndim == 3:
+            arr = arr[0]  # some exports wrap in a band dimension
         np.save(cache_path, arr)
         os.remove(tmp)
         print(f"[Koppen] Cached to {cache_path}  shape={arr.shape}")
@@ -103,9 +129,9 @@ def _download_npy(cache_path: Path) -> np.ndarray:
         if os.path.exists(tmp):
             os.remove(tmp)
         raise RuntimeError(
-            f"Failed to download Köppen raster: {e}\n"
-            "You can manually download a 0.5° uint8 numpy grid (360 rows × 720 cols)\n"
-            f"and save it to {cache_path}."
+            f"All download attempts failed: {e}\n"
+            "Manually save a 0.5° uint8 numpy grid (360 rows × 720 cols) to:\n"
+            f"  {cache_path}"
         ) from e
 
 
@@ -145,9 +171,59 @@ class KoppenClassifier:
         kc.get_group(48.85, 2.35)   # → "C"
     """
 
-    def __init__(self, cache_path: Union[str, Path, None] = None):
-        self._grid = load_koppen_raster(cache_path)   # [360, 720] uint8
-        self._n_rows, self._n_cols = self._grid.shape
+    def __init__(self, cache_path: Union[str, Path, None] = None, require_raster: bool = True):
+        if require_raster:
+            self._grid = load_koppen_raster(cache_path)   # [360, 720] uint8
+            self._n_rows, self._n_cols = self._grid.shape
+        else:
+            self._grid = None
+            self._n_rows = self._n_cols = 0
+        self._kdtree = None
+        self._kdtree_codes: Optional[np.ndarray] = None
+
+    @classmethod
+    def from_csv(cls, csv_path: Union[str, Path], max_points: int = 200_000) -> "KoppenClassifier":
+        """
+        Build a KoppenClassifier backed by a KD-tree of reference points from a CSV.
+
+        Useful when the raster cannot be downloaded: any (lat, lon) is classified
+        by finding the nearest reference point in the CSV and returning its climate code.
+        Climate zones are spatially smooth so this is accurate to well within 0.5°.
+
+        Args:
+            csv_path:   Path to a CSV with 'latitude', 'longitude', 'climate' columns.
+            max_points: Subsample to this many points to keep the tree small.
+        """
+        from scipy.spatial import cKDTree
+
+        print(f"[Koppen] Building KD-tree from {csv_path} (max {max_points:,} pts) …")
+        lats, lons, codes = [], [], []
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    c = int(float(row["climate"]))
+                except (KeyError, ValueError):
+                    continue
+                if c == 0:
+                    continue
+                lats.append(float(row["latitude"]))
+                lons.append(float(row["longitude"]))
+                codes.append(c)
+
+        lats  = np.array(lats,  dtype=np.float32)
+        lons  = np.array(lons,  dtype=np.float32)
+        codes = np.array(codes, dtype=np.uint8)
+
+        if len(lats) > max_points:
+            idx   = np.random.choice(len(lats), max_points, replace=False)
+            lats, lons, codes = lats[idx], lons[idx], codes[idx]
+
+        obj = cls(require_raster=False)
+        obj._kdtree       = cKDTree(np.stack([lats, lons], axis=1))
+        obj._kdtree_codes = codes
+        print(f"[Koppen] KD-tree ready: {len(codes):,} reference points.")
+        return obj
 
     # ------------------------------------------------------------------
     # Internal coordinate → grid-index conversion
@@ -215,24 +291,31 @@ class KoppenClassifier:
             return classes[0] if classes and classes != "?" else "?"
         return [c[0] if c and c != "?" else "?" for c in classes]
 
+    def classify_from_codes(self, codes) -> dict:
+        """
+        Convert precomputed integer climate codes (1-30) to classes/groups.
+        Skips the raster lookup — use this when the CSV already has a climate column.
+        """
+        codes = np.asarray(codes, dtype=int)
+        classes = [
+            KOPPEN_CLASSES[c] if 0 < c < len(KOPPEN_CLASSES) else "?"
+            for c in codes
+        ]
+        groups = [c[0] if c and c != "?" else "?" for c in classes]
+        return {"codes": codes, "classes": classes, "groups": groups}
+
     def classify_batch(
         self,
         lats: np.ndarray,
         lons: np.ndarray,
     ) -> dict:
         """
-        Classify a batch of coordinates.
-
-        Args:
-            lats: [N] latitudes in degrees.
-            lons: [N] longitudes in degrees.
-
-        Returns:
-            Dict with keys:
-                "codes"   — [N] int codes
-                "classes" — [N] str like "Cfb"
-                "groups"  — [N] str like "C"
+        Classify a batch of coordinates via raster lookup or KD-tree fallback.
         """
+        if self._kdtree is not None:
+            pts   = np.stack([np.asarray(lats), np.asarray(lons)], axis=1)
+            _, ii = self._kdtree.query(pts, workers=-1)
+            return self.classify_from_codes(self._kdtree_codes[ii])
         codes   = self.get_code(lats, lons)
         classes = self.get_class(lats, lons)
         groups  = [c[0] if c and c != "?" else "?" for c in classes]

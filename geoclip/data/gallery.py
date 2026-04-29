@@ -100,6 +100,7 @@ def compute_gallery_embeddings(
     model.eval()
     gallery_coords = gallery_coords.to(device)
     embeddings = []
+    print(f"[Gallery] Computing embeddings for {len(gallery_coords):,} points ...", flush=True)
 
     for i in range(0, len(gallery_coords), batch_size):
         batch = gallery_coords[i : i + batch_size]

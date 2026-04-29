@@ -89,6 +89,7 @@ def evaluate_by_zone(
     device: str = "cpu",
     thresholds_km: List[int] = GCD_THRESHOLDS_KM,
     gallery_batch_size: int = 512,
+    climate_codes=None,
 ) -> Dict[str, Dict]:
     """
     Gallery-based evaluation broken down by Köppen major climate group.
@@ -111,23 +112,30 @@ def evaluate_by_zone(
 
     # Collect distances grouped by true Köppen group
     group_distances: Dict[str, list] = defaultdict(list)
+    sample_idx = 0
 
     for images, true_coords in tqdm(dataloader, desc="Evaluating by zone"):
-        images     = images.to(device)
+        images      = images.to(device)
         true_coords = true_coords.to(device)
 
-        img_embs   = model.encode_image(images)
-        best_idx   = (img_embs @ gallery_embs.T).argmax(dim=-1)
+        img_embs    = model.encode_image(images)
+        best_idx    = (img_embs @ gallery_embs.T).argmax(dim=-1)
         pred_coords = gallery_coords_dev[best_idx]
-        dists      = haversine_distance(pred_coords, true_coords).cpu()
+        dists       = haversine_distance(pred_coords, true_coords).cpu()
 
-        true_np = true_coords.cpu().numpy()
-        groups  = classifier.get_group(true_np[:, 0], true_np[:, 1])
-        if isinstance(groups, str):
-            groups = [groups]
+        if climate_codes is not None:
+            batch_codes = climate_codes[sample_idx:sample_idx + len(images)]
+            info   = classifier.classify_from_codes(batch_codes)
+            groups = info["groups"]
+        else:
+            true_np = true_coords.cpu().numpy()
+            groups  = classifier.get_group(true_np[:, 0], true_np[:, 1])
+            if isinstance(groups, str):
+                groups = [groups]
 
         for g, d in zip(groups, dists.tolist()):
             group_distances[g].append(d)
+        sample_idx += len(images)
 
     results: Dict[str, Dict] = {}
     for group, dists_list in group_distances.items():

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 
 class IntegratedGradients:
@@ -68,25 +69,50 @@ class IntegratedGradients:
         with torch.no_grad():
             gps_emb = self.model.encode_gps(target_coords)  # [B, D]
 
-        accumulated_grads = torch.zeros_like(images)
+        B = images.shape[0]
+        all_attrs = []
 
-        for step in range(1, self.n_steps + 1):
-            alpha = step / self.n_steps
-            interp = (baseline + alpha * (images - baseline)).detach().requires_grad_(True)
+        for b in tqdm(range(B), desc="IG samples", leave=False):
+            img_b      = images[b:b+1]
+            baseline_b = baseline[b:b+1]
+            gps_b      = gps_emb[b:b+1]
+            accum      = torch.zeros_like(img_b)
 
-            img_emb = self.model.image_encoder(interp)              # [B, D]
-            score = (img_emb * gps_emb.detach()).sum()
-            score.backward()
+            for step in tqdm(range(1, self.n_steps + 1), desc="steps", leave=False):
+                alpha  = step / self.n_steps
+                interp = (baseline_b + alpha * (img_b - baseline_b)).detach().requires_grad_(True)
+                score  = (self.model.image_encoder(interp) * gps_b.detach()).sum()
+                score.backward()
+                accum += interp.grad.detach()
 
-            accumulated_grads += interp.grad.detach()
-
-        avg_grads = accumulated_grads / self.n_steps
+            avg_grads = accum / self.n_steps
+            all_attrs.append((img_b.detach() - baseline_b) * avg_grads)
 
         # IG = (input - baseline) × average gradient  [B, 3, H, W]
-        attributions = (images.detach() - baseline) * avg_grads
+        attributions = torch.cat(all_attrs, dim=0)
 
         # Collapse channels: sum of absolute attributions per pixel [B, H, W]
         attr_map = attributions.abs().sum(dim=1)
+
+        # Average within each patch to remove the Conv2d stride artifact:
+        # pixel-level gradients through a strided patch embedding are identical
+        # within each patch, producing a visible grid. Pooling then upsampling
+        # replaces that grid with a smooth per-patch saliency map.
+        # Pool to patch resolution then upsample — removes the Conv2d stride artifact
+        patch_size = self.model.image_encoder.vit.patch_embed.proj.kernel_size[0]
+        H, W = images.shape[-2:]
+        pooled   = F.avg_pool2d(attr_map.unsqueeze(1), kernel_size=patch_size, stride=patch_size)
+        attr_map = F.interpolate(pooled, size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
+        # Gaussian blur to smooth hard patch boundaries
+        sigma  = patch_size / 2.0
+        ks     = patch_size | 1  # next odd number ≥ patch_size
+        coords = torch.arange(ks, dtype=torch.float32) - ks // 2
+        kernel_1d = torch.exp(-0.5 * (coords / sigma) ** 2)
+        kernel_1d = kernel_1d / kernel_1d.sum()
+        kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]      # [ks, ks]
+        kernel_2d = kernel_2d[None, None].to(attr_map.device)    # [1, 1, ks, ks]
+        attr_map  = F.conv2d(attr_map.unsqueeze(1), kernel_2d,
+                             padding=ks // 2).squeeze(1)
 
         # Per-sample normalization to [0, 1]
         a_min = attr_map.flatten(1).min(1).values[:, None, None]

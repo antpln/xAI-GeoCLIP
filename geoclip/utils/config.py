@@ -15,11 +15,18 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
+    mode: str = "hf"              # hf | subset | streaming | sharded | local
     subset_size: Optional[int] = 50000
     num_shards: Optional[int] = None
     streaming: bool = False
     num_workers: int = 4
     pin_memory: bool = True
+    local_files_only: bool = False
+    # local mode
+    zip_dir: Optional[str] = None
+    train_csv: Optional[str] = None
+    val_csv: Optional[str] = None
+    val_zip_dir: Optional[str] = None
 
 
 @dataclass

@@ -3,22 +3,22 @@ Main training entry point for GeoCLIP.
 
 Usage:
     python scripts/train.py --config configs/default.yaml
-    python scripts/train.py --config configs/small_experiment.yaml --device cuda
+    python scripts/train.py --config configs/default.yaml --device cuda
     python scripts/train.py --config configs/default.yaml --resume checkpoints/epoch_010.pt
-    python scripts/train.py --config configs/default.yaml --hf_home /data/hf_cache
-    python scripts/train.py --config configs/default.yaml --dataset_mode streaming
+    python scripts/train.py --config configs/local_partial.yaml
 """
 import argparse
 import os
+import random
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from geoclip.models.geoclip import GeoCLIP
-from geoclip.data.dataset import OSV5MDataset
+from geoclip.data.dataset import OSV5MDataset, LocalZipOSV5MDataset
 from geoclip.data.shard_dataset import ShardedOSV5MDataset, StreamingOSV5MDataset
 from geoclip.data.transforms import get_train_transform, get_eval_transform
 from geoclip.data.gallery import load_or_build_gallery
@@ -33,45 +33,30 @@ def main():
     parser.add_argument("--resume", default=None, help="Path to checkpoint to resume from")
     parser.add_argument(
         "--hf_home", default=None,
-        help="Root directory for HuggingFace downloads (overrides HF_HOME env var). "
-             "Datasets, model weights, and hub files all go here.",
-    )
-    parser.add_argument(
-        "--dataset_mode", default="hf",
-        choices=["hf", "subset", "streaming", "sharded"],
-        help=(
-            "hf       — full HF download, cached locally (default)\n"
-            "subset   — stream only subset_size samples from HF\n"
-            "streaming — lazy webdataset stream, no disk usage\n"
-            "sharded  — rotating wds shards with background prefetch"
-        ),
-    )
-    parser.add_argument(
-        "--local_files_only", action="store_true",
-        help="Only load dataset from local storage, fail if not found.",
+        help="Root directory for HuggingFace downloads (overrides HF_HOME env var).",
     )
     args = parser.parse_args()
 
     cfg = load_config(args.config)
     device = args.device
 
-    # Set HF_HOME before any HF import so all downloads land in the right place.
     hf_home = args.hf_home or os.environ.get("HF_HOME")
     if hf_home:
         os.makedirs(hf_home, exist_ok=True)
         os.environ["HF_HOME"] = hf_home
         print(f"[Train] HF home: {hf_home}")
 
-    print(f"[Train] Device: {device} | Dataset mode: {args.dataset_mode}")
+    print(f"[Train] Device: {device} | Dataset mode: {cfg.data.mode}")
 
     # ── Train dataset ──────────────────────────────────────────────────────────
-    if args.dataset_mode == "hf":
-        train_dataset = OSV5MDataset(
-            split="train",
-            subset_size=cfg.data.subset_size,
+    if cfg.data.mode == "local":
+        if not cfg.data.zip_dir or not cfg.data.train_csv:
+            raise ValueError("data.mode=local requires data.zip_dir and data.train_csv in config")
+
+        train_dataset = LocalZipOSV5MDataset(
+            zip_dir=cfg.data.zip_dir,
+            csv_path=cfg.data.train_csv,
             transform=get_train_transform(),
-            cache_dir=hf_home,
-            local_files_only=args.local_files_only,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.training.batch_size,
@@ -79,13 +64,13 @@ def main():
             pin_memory=cfg.data.pin_memory, drop_last=True,
         )
 
-    elif args.dataset_mode == "subset":
+    elif cfg.data.mode in ("hf", "subset"):
         train_dataset = OSV5MDataset(
             split="train",
             subset_size=cfg.data.subset_size,
             transform=get_train_transform(),
             cache_dir=hf_home,
-            local_files_only=args.local_files_only,
+            local_files_only=cfg.data.local_files_only,
         )
         train_loader = DataLoader(
             train_dataset, batch_size=cfg.training.batch_size,
@@ -93,7 +78,7 @@ def main():
             pin_memory=cfg.data.pin_memory, drop_last=True,
         )
 
-    elif args.dataset_mode == "streaming":
+    elif cfg.data.mode == "streaming":
         train_dataset = StreamingOSV5MDataset(
             split="train",
             num_shards=cfg.data.num_shards,
@@ -122,14 +107,31 @@ def main():
             pin_memory=cfg.data.pin_memory, drop_last=True,
         )
 
-    # ── Validation dataset (always HF) ────────────────────────────────────────
-    val_dataset = OSV5MDataset(
-        split="val",
-        subset_size=min(cfg.data.subset_size or 5000, 5000),
-        transform=get_eval_transform(),
-        cache_dir=hf_home,
-        local_files_only=args.local_files_only,
-    )
+    # ── Validation dataset ────────────────────────────────────────────────────
+    if cfg.data.mode == "local" and cfg.data.val_csv:
+        val_zip_dir = cfg.data.val_zip_dir or cfg.data.zip_dir
+        val_dataset = LocalZipOSV5MDataset(
+            zip_dir=val_zip_dir,
+            csv_path=cfg.data.val_csv,
+            transform=get_eval_transform(),
+        )
+        if len(val_dataset) > 5000:
+            indices = random.sample(range(len(val_dataset)), 5000)
+            val_dataset = Subset(val_dataset, indices)
+    elif cfg.data.mode == "local":
+        # No separate val data — hold out 5 % of training samples
+        n_val = min(5000, max(1, int(0.05 * len(train_dataset))))
+        indices = random.sample(range(len(train_dataset)), n_val)
+        val_dataset = Subset(train_dataset, indices)
+        print(f"[Train] Using {n_val} held-out train samples as validation set")
+    else:
+        val_dataset = OSV5MDataset(
+            split="val",
+            subset_size=min(cfg.data.subset_size or 5000, 5000),
+            transform=get_eval_transform(),
+            cache_dir=hf_home,
+            local_files_only=cfg.data.local_files_only,
+        )
     val_loader = DataLoader(
         val_dataset, batch_size=cfg.training.batch_size,
         shuffle=False, num_workers=cfg.data.num_workers,

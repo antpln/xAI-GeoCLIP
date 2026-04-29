@@ -28,11 +28,14 @@ class GradCAM:
         self._bwd_hook = target.register_full_backward_hook(self._save_gradient)
 
     def _save_activation(self, module, input, output):
-        # TransformerBlock returns (hidden, attn_weights); skip CLS at index 0
-        self._activations = output[0][:, 1:, :].detach()  # [B, num_patches, D]
+        # Capture block INPUT (not output): patch positions in the block output
+        # have zero gradient for the last block since only tokens[:,0] feeds the score.
+        # The block input at patch positions receives gradient via the next block's attention.
+        self._activations = input[0][:, 1:, :].detach()  # [B, num_patches, D]
 
     def _save_gradient(self, module, grad_input, grad_output):
-        self._gradients = grad_output[0][:, 1:, :].detach()  # [B, num_patches, D]
+        # grad_input[0] is gradient w.r.t. the block input — non-zero at patch positions
+        self._gradients = grad_input[0][:, 1:, :].detach()  # [B, num_patches, D]
 
     def compute(
         self,
@@ -54,8 +57,11 @@ class GradCAM:
         score = (img_emb * gps_emb).sum()               # scalar cosine similarity
         score.backward()
 
-        # Weight each patch activation by its mean gradient across the feature dimension
-        weights = self._gradients.mean(dim=-1, keepdim=True)  # [B, num_patches, 1]
+        # Standard Grad-CAM: average gradient over the spatial (patch) dimension
+        # to get a per-feature weight, then dot with per-patch activations.
+        # (Averaging over features instead — the previous bug — gives a uniform
+        # scalar per patch that wipes out spatial variation.)
+        weights = self._gradients.mean(dim=1, keepdim=True)   # [B, 1, D]
         cam = (weights * self._activations).sum(dim=-1)        # [B, num_patches]
 
         if relu:

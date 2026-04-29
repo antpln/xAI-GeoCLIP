@@ -8,6 +8,7 @@ model:
   embedding_dim: 512
 
 data:
+  mode: "hf"
   subset_size: 5000
   streaming: false
   num_workers: 2

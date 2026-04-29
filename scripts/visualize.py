@@ -53,6 +53,7 @@ Usage:
 import argparse
 import os
 import sys
+import time
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -66,7 +67,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from geoclip.models.geoclip import GeoCLIP
-from geoclip.data.dataset import OSV5MDataset
+from geoclip.data.dataset import OSV5MDataset, LocalZipOSV5MDataset
 from geoclip.data.transforms import get_eval_transform
 from geoclip.data.gallery import load_or_build_gallery, compute_gallery_embeddings
 from geoclip.interpretability.gradcam import gradcam_context, gradcam_layerwise
@@ -91,7 +92,8 @@ BATCH_METHODS = {
 }
 FULLSET_METHODS = {"koppen", "error_dist", "tsne", "calibration", "zone_perf"}
 CKPT_METHODS    = {"training_curves"}
-ALL_METHODS     = sorted(BATCH_METHODS | FULLSET_METHODS | CKPT_METHODS)
+TRAIN_METHODS   = {"contamination"}   # require --train_zip_dir + --train_csv
+ALL_METHODS     = sorted(BATCH_METHODS | FULLSET_METHODS | CKPT_METHODS | TRAIN_METHODS)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +141,8 @@ def save_grid(rows_data, col_titles, output_path, row_labels=None, suptitle=""):
 def run_gradcam(model, images, true_coords, img_nps, out_dir):
     with gradcam_context(model) as gc:
         maps = gc.compute(images, true_coords)
-    rows = [[img_nps[i], overlay(img_nps[i], maps[i].numpy())] for i in range(len(images))]
+    rows = [[img_nps[i], overlay(img_nps[i], maps[i].numpy())]
+            for i in tqdm(range(len(images)), desc="gradcam samples", leave=False)]
     save_grid(rows, ["Input", "Grad-CAM"], os.path.join(out_dir, "gradcam.png"),
               suptitle="Grad-CAM")
     return maps
@@ -148,7 +151,8 @@ def run_gradcam(model, images, true_coords, img_nps, out_dir):
 def run_rollout(model, images, img_nps, out_dir):
     with attention_rollout_context(model, head_fusion="mean", discard_ratio=0.1) as ar:
         maps = ar.compute(images)
-    rows = [[img_nps[i], overlay(img_nps[i], maps[i].numpy())] for i in range(len(images))]
+    rows = [[img_nps[i], overlay(img_nps[i], maps[i].numpy())]
+            for i in tqdm(range(len(images)), desc="rollout samples", leave=False)]
     save_grid(rows, ["Input", "Attention Rollout"], os.path.join(out_dir, "rollout.png"),
               suptitle="Attention Rollout")
     return maps
@@ -157,7 +161,8 @@ def run_rollout(model, images, img_nps, out_dir):
 def run_ig(model, images, true_coords, img_nps, out_dir, n_steps=50):
     ig = IntegratedGradients(model, n_steps=n_steps)
     maps = ig.compute(images, true_coords)
-    rows = [[img_nps[i], overlay(img_nps[i], maps[i].numpy())] for i in range(len(images))]
+    rows = [[img_nps[i], overlay(img_nps[i], maps[i].numpy())]
+            for i in tqdm(range(len(images)), desc="ig samples", leave=False)]
     save_grid(rows, ["Input", "Integrated Gradients"],
               os.path.join(out_dir, "ig.png"), suptitle="Integrated Gradients")
     return maps
@@ -168,7 +173,7 @@ def run_layerwise(model, images, true_coords, img_nps, out_dir,
     lw = gradcam_layerwise(model, images, true_coords, layer_indices=layer_indices)
     rows = [
         [img_nps[i]] + [overlay(img_nps[i], lw[idx][i].numpy()) for idx in layer_indices]
-        for i in range(len(images))
+        for i in tqdm(range(len(images)), desc="layerwise samples", leave=False)
     ]
     col_titles = ["Input"] + [f"Block {idx}" for idx in layer_indices]
     save_grid(rows, col_titles, os.path.join(out_dir, "layerwise_gradcam.png"),
@@ -178,13 +183,13 @@ def run_layerwise(model, images, true_coords, img_nps, out_dir,
 
 def run_heads(model, images, img_nps, out_dir):
     pha = PerHeadAttention(model, layer_idx=-1)
-    head_maps = pha.compute(images)          # [N, num_heads, H, W]
+    head_maps = pha.compute(images)
     num_heads = head_maps.shape[1]
     rows = [
         [img_nps[i]] + [overlay(img_nps[i], head_maps[i, h].numpy()) for h in range(num_heads)]
-        for i in range(len(images))
+        for i in tqdm(range(len(images)), desc="head samples", leave=False)
     ]
-    col_titles = ["Input"] + [f"Head {h}" for h in range(num_heads)]
+    col_titles = ["Input"] + [f"Head {h} (rank {r+1})" for r, h in enumerate(range(num_heads))]
     save_grid(rows, col_titles, os.path.join(out_dir, "per_head_attention.png"),
               suptitle="Per-head Attention (last layer)")
     return head_maps
@@ -223,7 +228,7 @@ def run_all_methods(model, images, true_coords, img_nps,
     col_titles   = ["Input"] + method_names
 
     rows = []
-    for i in range(N):
+    for i in tqdm(range(N), desc="all_methods samples", leave=False):
         rows.append([
             img_nps[i],
             overlay(img_nps[i], gcam_maps[i].numpy()),
@@ -238,42 +243,33 @@ def run_all_methods(model, images, true_coords, img_nps,
               row_labels=row_labels, suptitle="All methods — sample comparison")
 
 
-def run_good_vs_bad(model, images, true_coords, distances, out_dir, n_steps=50):
-    """Section 13 — Grad-CAM + IG for correct vs. wrong predictions."""
-    good_mask = distances < 200
-    bad_mask  = distances > 750
-
-    if not good_mask.any() or not bad_mask.any():
-        print("[Visualize] good_vs_bad: not enough contrasting samples in this batch "
-              "(need ≥1 sample <200 km and ≥1 >750 km). Try --num_samples 8.")
-        return
-
-    gi = good_mask.nonzero()[0].item()
-    bi = bad_mask.nonzero()[0].item()
-    pair_images = torch.stack([images[gi], images[bi]])
-    pair_coords = torch.stack([true_coords[gi], true_coords[bi]])
+def run_good_vs_bad(model, good_images, good_coords, good_dists,
+                    bad_images, bad_coords, bad_dists, out_dir, n_steps=50):
+    """Grad-CAM + IG comparison across good and bad predictions."""
+    n_good, n_bad = len(good_images), len(bad_images)
+    all_images = torch.cat([good_images, bad_images])
+    all_coords = torch.cat([good_coords, bad_coords])
+    all_dists  = torch.cat([good_dists,  bad_dists])
 
     with gradcam_context(model) as gc:
-        gcam_pair = gc.compute(pair_images, pair_coords)
-    ig_pair = IntegratedGradients(model, n_steps=n_steps).compute(pair_images, pair_coords)
+        gcam_all = gc.compute(all_images, all_coords)
+    ig_all = IntegratedGradients(model, n_steps=n_steps).compute(all_images, all_coords)
 
-    labels = [f"Good — {distances[gi]:.0f} km", f"Bad — {distances[bi]:.0f} km"]
-    colors = ["green", "red"]
+    labels = ([f"Good — {d:.0f} km" for d in good_dists.tolist()] +
+              [f"Bad  — {d:.0f} km" for d in bad_dists.tolist()])
+    colors = ["green"] * n_good + ["red"] * n_bad
 
-    fig, axes = plt.subplots(2, 3, figsize=(10, 7))
+    fig, axes = plt.subplots(n_good + n_bad, 3, figsize=(10, 3.5 * (n_good + n_bad)))
     for row, (img_t, gc_map, ig_map, label, color) in enumerate(
-        zip(pair_images, gcam_pair, ig_pair, labels, colors)
+        zip(all_images, gcam_all, ig_all, labels, colors)
     ):
         p = denormalize(img_t)
-        axes[row][0].imshow(p)
+        axes[row][0].imshow(p);              axes[row][0].axis("off")
         axes[row][0].set_title(label, fontsize=9, color=color)
-        axes[row][0].axis("off")
-        axes[row][1].imshow(overlay(p, gc_map.numpy()))
+        axes[row][1].imshow(overlay(p, gc_map.numpy())); axes[row][1].axis("off")
         axes[row][1].set_title("Grad-CAM", fontsize=9)
-        axes[row][1].axis("off")
-        axes[row][2].imshow(overlay(p, ig_map.numpy()))
+        axes[row][2].imshow(overlay(p, ig_map.numpy())); axes[row][2].axis("off")
         axes[row][2].set_title("Integrated Gradients", fontsize=9)
-        axes[row][2].axis("off")
 
     plt.suptitle("Good vs. Bad Predictions", fontsize=12)
     plt.tight_layout()
@@ -352,9 +348,10 @@ def run_topk(model, images, true_coords, img_nps, gallery_coords, gallery_embs,
 # Full validation-set analyses
 # ---------------------------------------------------------------------------
 
-def run_koppen(model, val_loader, gallery_coords, gallery_embs, out_dir, device):
+def run_koppen(model, val_loader, gallery_coords, gallery_embs, out_dir, device,
+               climate_codes=None, pred_classifier=None):
     """Section 14 — Köppen-Geiger climate analysis."""
-    kc = KoppenClassifier()
+    kc = KoppenClassifier(require_raster=(climate_codes is None))
     all_true, all_pred, all_dist = [], [], []
 
     model.eval()
@@ -371,8 +368,15 @@ def run_koppen(model, val_loader, gallery_coords, gallery_embs, out_dir, device)
     pred_np = torch.cat(all_pred).numpy()
     distances = torch.cat(all_dist)
 
-    true_info = kc.classify_batch(true_np[:, 0], true_np[:, 1])
-    pred_info  = kc.classify_batch(pred_np[:, 0], pred_np[:, 1])
+    if climate_codes is not None:
+        true_info = kc.classify_from_codes(climate_codes[:len(true_np)])
+    else:
+        true_info = kc.classify_batch(true_np[:, 0], true_np[:, 1])
+    pred_kc = pred_classifier or (kc if kc._grid is not None else None)
+    if pred_kc is not None:
+        pred_info = pred_kc.classify_batch(pred_np[:, 0], pred_np[:, 1])
+    else:
+        pred_info = kc.classify_from_codes([0] * len(pred_np))
     coherence  = [classify_error(tg, pg)
                   for tg, pg in zip(true_info["groups"], pred_info["groups"])]
 
@@ -390,31 +394,50 @@ def run_koppen(model, val_loader, gallery_coords, gallery_embs, out_dir, device)
     for tg, pg in zip(true_info["groups"], pred_info["groups"]):
         conf[g2i[tg], g2i[pg]] += 1
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
-    axes[0].pie([s for _, s, _ in active],
-                labels=[f"{l}\n({s})" for l, s, _ in active],
-                colors=[c for _, _, c in active], autopct="%1.0f%%", startangle=140,
-                textprops={"fontsize": 9})
-    axes[0].set_title("Error coherence with Köppen zones", fontsize=11)
-
-    im = axes[1].imshow(conf, cmap="Blues")
-    axes[1].set_xticks(range(n_g)); axes[1].set_xticklabels(groups_order)
-    axes[1].set_yticks(range(n_g)); axes[1].set_yticklabels(groups_order)
-    axes[1].set_xlabel("Predicted group"); axes[1].set_ylabel("True group")
-    axes[1].set_title("Confusion matrix — major climate groups", fontsize=11)
-    for r in range(n_g):
-        for c in range(n_g):
-            if conf[r, c] > 0:
-                axes[1].text(c, r, str(conf[r, c]), ha="center", va="center",
-                             fontsize=11,
-                             color="white" if conf[r, c] > conf.max() * 0.5 else "black")
-    plt.colorbar(im, ax=axes[1], fraction=0.046, pad=0.04)
-    patches = [mpatches.Patch(color=GROUP_COLORS.get(g, "#fff"),
-                               label=f"{g} — {KOPPEN_GROUPS.get(g, 'Ocean')}")
-               for g in groups_order if g != "?"]
-    axes[1].legend(handles=patches, fontsize=7, bbox_to_anchor=(1.25, 1), title="Group")
+    # ── Figure 1: coherence pie ──────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.pie([s for _, s, _ in active],
+           labels=[f"{l}\n({s})" for l, s, _ in active],
+           colors=[c for _, _, c in active], autopct="%1.0f%%", startangle=140,
+           textprops={"fontsize": 10})
+    ax.set_title("Error coherence with Köppen zones", fontsize=12)
     plt.tight_layout()
     path = os.path.join(out_dir, "koppen_coherence.png")
+    plt.savefig(path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[Visualize] Saved {path}")
+
+    # ── Figure 2: confusion matrix (counts + row-normalised %) ───────────────
+    row_sums = conf.sum(axis=1, keepdims=True).clip(min=1)
+    conf_pct = conf / row_sums * 100          # row-normalised: recall per true zone
+
+    group_labels = [f"{g}\n{KOPPEN_GROUPS.get(g, 'Ocean')}" for g in groups_order]
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    for ax, data, title, fmt in zip(
+        axes,
+        [conf, conf_pct],
+        ["Counts", "Row-normalised (recall %)"],
+        ["{:.0f}", "{:.1f}%"],
+    ):
+        im = ax.imshow(data, cmap="Blues", vmin=0)
+        ax.set_xticks(range(n_g)); ax.set_xticklabels(group_labels, fontsize=8)
+        ax.set_yticks(range(n_g)); ax.set_yticklabels(group_labels, fontsize=8)
+        ax.set_xlabel("Predicted group", fontsize=9)
+        ax.set_ylabel("True group", fontsize=9)
+        ax.set_title(title, fontsize=10)
+        threshold = data.max() * 0.5
+        for r in range(n_g):
+            for c in range(n_g):
+                if data[r, c] > 0:
+                    ax.text(c, r, fmt.format(data[r, c]), ha="center", va="center",
+                            fontsize=8,
+                            color="white" if data[r, c] > threshold else "black")
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.suptitle("Köppen climate group confusion matrix", fontsize=13)
+    plt.tight_layout()
+    path = os.path.join(out_dir, "koppen_confusion.png")
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"[Visualize] Saved {path}")
@@ -475,7 +498,7 @@ def run_error_dist(model, val_loader, gallery_coords, gallery_embs, thresholds_k
           f"| 90th p: {torch.quantile(all_dists, 0.9):.0f} km")
 
 
-def run_tsne(model, val_loader, out_dir, device, n_samples=512):
+def run_tsne(model, val_loader, out_dir, device, n_samples=512, classifier=None):
     """Section 18 — t-SNE of image and GPS embeddings."""
     from sklearn.manifold import TSNE
 
@@ -496,12 +519,13 @@ def run_tsne(model, val_loader, out_dir, device, n_samples=512):
     all_embs = torch.cat([img_embs, gps_embs]).numpy()
     print(f"[Visualize] Running t-SNE on {len(all_embs)} embeddings …")
     proj = TSNE(n_components=2, perplexity=40, random_state=0,
-                n_iter=1000).fit_transform(all_embs)
+                max_iter=1000).fit_transform(all_embs)
     img_proj = proj[:n_samples]
     gps_proj = proj[n_samples:]
 
-    kc = KoppenClassifier()
-    groups = kc.get_group(coords_t[:, 0], coords_t[:, 1])
+    kc = classifier or KoppenClassifier(require_raster=False)
+    info   = kc.classify_batch(coords_t[:, 0], coords_t[:, 1])
+    groups = info["groups"]
     colors = [GROUP_COLORS.get(g, "#aaaaaa") for g in groups]
 
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
@@ -577,12 +601,14 @@ def run_calibration(model, val_loader, gallery_coords, gallery_embs, out_dir, de
     print(f"Pearson r (sim, error) = {r:.3f}")
 
 
-def run_zone_perf(model, val_loader, gallery_coords, thresholds_km, out_dir, device):
+def run_zone_perf(model, val_loader, gallery_coords, thresholds_km, out_dir, device,
+                  climate_codes=None):
     """Section 21 — per-Köppen-zone performance."""
-    kc = KoppenClassifier()
+    kc = KoppenClassifier(require_raster=(climate_codes is None))
     zone_metrics = evaluate_by_zone(
         model, val_loader, gallery_coords, kc,
         device=device, thresholds_km=thresholds_km,
+        climate_codes=climate_codes,
     )
 
     groups_sorted = sorted(zone_metrics, key=lambda g: -zone_metrics[g]["count"])
@@ -713,6 +739,102 @@ def run_training_curves(checkpoint_dir, out_dir):
 
 
 # ---------------------------------------------------------------------------
+# Contamination check
+# ---------------------------------------------------------------------------
+
+def run_contamination_check(
+    model, test_images, test_coords, test_img_nps, test_distances,
+    train_zip_dir, train_csv, out_dir, device,
+    n_train_samples: int = 10_000, top_k: int = 3,
+):
+    """
+    For each good test image find the most visually similar training images.
+
+    High cosine similarity + large GPS gap  → model learned real features.
+    High cosine similarity + tiny GPS gap   → possible data contamination
+                                              (near-duplicate in both splits).
+    """
+    from torch.utils.data import Subset, DataLoader as DL
+
+    # ── Sample & encode training images ──────────────────────────────────────
+    train_ds = LocalZipOSV5MDataset(train_zip_dir, train_csv,
+                                    transform=get_eval_transform())
+    n = min(n_train_samples, len(train_ds))
+    idx = random.sample(range(len(train_ds)), n)
+    train_subset = Subset(train_ds, idx)
+    loader = DL(train_subset, batch_size=64, shuffle=False, num_workers=0)
+
+    train_embs, train_coords_all = [], []
+    model.eval()
+    with torch.no_grad():
+        for imgs, coords in tqdm(loader, desc="Encoding train sample", leave=False):
+            train_embs.append(model.encode_image(imgs.to(device)).cpu())
+            train_coords_all.append(coords)
+    train_embs   = torch.cat(train_embs)        # [N, D]
+    train_coords = torch.cat(train_coords_all)  # [N, 2]
+
+    # ── Query each test image ─────────────────────────────────────────────────
+    with torch.no_grad():
+        test_embs = model.encode_image(test_images.to(device)).cpu()  # [B, D]
+
+    sims     = test_embs @ train_embs.T                   # [B, N]
+    top_vals, top_idx = sims.topk(top_k, dim=-1)          # [B, top_k]
+
+    # ── Load train images for display ────────────────────────────────────────
+    # Collect all unique train indices needed
+    flat_idx = top_idx.flatten().tolist()
+    train_imgs_needed = {}
+    for ti in set(flat_idx):
+        img_t, coord_t = train_ds[idx[ti]]
+        train_imgs_needed[ti] = (denormalize(img_t), coord_t)
+
+    # ── Build figure ─────────────────────────────────────────────────────────
+    B = len(test_images)
+    col_titles = ["Test image (good)"] + [f"Train match #{k+1}" for k in range(top_k)]
+    rows = []
+    contamination_flags = []
+
+    for b in range(B):
+        tc = test_coords[b].numpy()
+        row = [test_img_nps[b]]
+        flagged = False
+        for k in range(top_k):
+            ti       = top_idx[b, k].item()
+            sim      = top_vals[b, k].item()
+            tr_img, tr_coord = train_imgs_needed[ti]
+            gps_dist = haversine_distance(
+                torch.tensor(tc).unsqueeze(0),
+                tr_coord.unsqueeze(0),
+            ).item()
+            # Annotate: red border hint if very similar AND close (<50 km)
+            flagged = flagged or (sim > 0.90 and gps_dist < 50)
+            # Overlay similarity + distance as text on the train image
+            ann = tr_img.copy()
+            import cv2 as _cv2
+            label = f"sim={sim:.3f}  {gps_dist:.0f}km"
+            _cv2.putText(ann, label, (4, 18), _cv2.FONT_HERSHEY_SIMPLEX,
+                         0.45, (255, 255, 0), 1, _cv2.LINE_AA)
+            row.append(ann)
+        rows.append(row)
+        contamination_flags.append(flagged)
+
+    row_labels = [
+        f"{'⚠ ' if contamination_flags[b] else ''}"
+        f"{test_distances[b]:.0f} km err"
+        for b in range(B)
+    ]
+    save_grid(rows, col_titles,
+              os.path.join(out_dir, "contamination_check.png"),
+              row_labels=row_labels,
+              suptitle=f"Contamination check — top-{top_k} train matches "
+                       f"(⚠ = sim>0.90 and GPS<50 km)")
+
+    n_flagged = sum(contamination_flags)
+    print(f"[Contamination] Flagged {n_flagged}/{B} test images "
+          f"(sim>0.90 and GPS distance <50 km to nearest train image)")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -727,8 +849,8 @@ def main():
     parser.add_argument("--hf_home", default=None,
                         help="HuggingFace cache directory (overrides HF_HOME env var)")
     parser.add_argument("--methods", nargs="+", default=["gradcam", "ig", "worldmap"],
-                        choices=ALL_METHODS, metavar="METHOD",
-                        help=f"One or more of: {', '.join(ALL_METHODS)}")
+                        metavar="METHOD",
+                        help=f"One or more of: {', '.join(ALL_METHODS)}, or 'all'")
     # Batch options
     parser.add_argument("--num_samples", type=int, default=4,
                         help="Number of images for batch-level methods")
@@ -742,6 +864,17 @@ def main():
     # Training curves
     parser.add_argument("--checkpoint_dir", default=None,
                         help="Directory with epoch_*.pt files (for training_curves)")
+    # Local dataset
+    parser.add_argument("--zip_dir", default=None,
+                        help="Local zip directory (overrides HF dataset loading)")
+    parser.add_argument("--eval_csv", default=None,
+                        help="CSV metadata file for local zip dataset")
+    parser.add_argument("--train_csv", default=None,
+                        help="Optional: denser reference CSV for Köppen KD-tree (defaults to eval_csv)")
+    parser.add_argument("--train_zip_dir", default=None,
+                        help="[contamination] Directory of train zip files")
+    parser.add_argument("--n_train_samples", type=int, default=10_000,
+                        help="[contamination] Number of train images to sample for the index")
     # Output
     parser.add_argument("--output_dir", default="outputs/visualizations/")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -754,7 +887,7 @@ def main():
         os.makedirs(hf_home, exist_ok=True)
         os.environ["HF_HOME"] = hf_home
 
-    methods = set(args.methods)
+    methods = (BATCH_METHODS | FULLSET_METHODS) if "all" in args.methods else set(args.methods)
     device  = args.device
 
     # Training curves needs no model
@@ -788,12 +921,24 @@ def main():
     model = model.to(device).eval()
 
     # Dataset + gallery (shared by all remaining methods)
-    dataset = OSV5MDataset(
-        split=args.eval_split,
-        subset_size=max(args.eval_subset, args.num_samples * 4),
-        transform=get_eval_transform(),
-        cache_dir=hf_home,
-    )
+    if args.zip_dir and args.eval_csv:
+        dataset = LocalZipOSV5MDataset(
+            zip_dir=args.zip_dir,
+            csv_path=args.eval_csv,
+            transform=get_eval_transform(),
+        )
+        if len(dataset) > max(args.eval_subset, args.num_samples * 4):
+            from torch.utils.data import Subset
+            import random
+            dataset = Subset(dataset, random.sample(range(len(dataset)),
+                                                    max(args.eval_subset, args.num_samples * 4)))
+    else:
+        dataset = OSV5MDataset(
+            split=args.eval_split,
+            subset_size=max(args.eval_subset, args.num_samples * 4),
+            transform=get_eval_transform(),
+            cache_dir=hf_home,
+        )
     gallery_coords = load_or_build_gallery(
         strategy=cfg.gallery.strategy,
         size=cfg.gallery.size,
@@ -809,64 +954,149 @@ def main():
             dataset, batch_size=64, shuffle=False,
             num_workers=cfg.data.num_workers,
         )
-        if "error_dist" in fullset_requested:
-            run_error_dist(model, full_loader, gallery_coords, gallery_embs,
-                           cfg.evaluation.thresholds_km, args.output_dir, device)
-        if "calibration" in fullset_requested:
-            run_calibration(model, full_loader, gallery_coords, gallery_embs,
-                            args.output_dir, device)
-        if "koppen" in fullset_requested:
-            run_koppen(model, full_loader, gallery_coords, gallery_embs,
-                       args.output_dir, device)
-        if "zone_perf" in fullset_requested:
-            run_zone_perf(model, full_loader, gallery_coords,
-                          cfg.evaluation.thresholds_km, args.output_dir, device)
-        if "tsne" in fullset_requested:
-            run_tsne(model, full_loader, args.output_dir, device,
-                     n_samples=min(512, args.eval_subset))
+        # Unwrap Subset to reach climate_codes; filter by subset indices if needed
+        _base = getattr(dataset, "dataset", dataset)
+        _codes = getattr(_base, "climate_codes", None)
+        if _codes is not None and hasattr(dataset, "indices"):
+            _codes = [_codes[i] for i in dataset.indices]
+        climate_codes = _codes
 
-    # ── Batch-level methods ────────────────────────────────────────────────────
+        # Build a KD-tree classifier so predicted coords can be classified
+        # without the raster. Prefer train_csv (denser global coverage) but
+        # fall back to eval_csv — its full split covers the globe well enough.
+        _kc_for_pred = None
+        _ref_csv = (args.train_csv if args.train_csv and os.path.exists(args.train_csv)
+                    else args.eval_csv if args.eval_csv and os.path.exists(args.eval_csv)
+                    else None)
+        if _ref_csv:
+            _kc_for_pred = KoppenClassifier.from_csv(_ref_csv)
+
+        def _timed_full(label, fn, *a, **kw):
+            print(f"\n[Visualize] ── {label.upper()} ──", flush=True)
+            t0 = time.time()
+            fn(*a, **kw)
+            print(f"[Visualize] {label} done ({time.time()-t0:.1f}s)", flush=True)
+
+        if "error_dist"  in fullset_requested:
+            _timed_full("error_dist",  run_error_dist, model, full_loader, gallery_coords,
+                        gallery_embs, cfg.evaluation.thresholds_km, args.output_dir, device)
+        if "calibration" in fullset_requested:
+            _timed_full("calibration", run_calibration, model, full_loader, gallery_coords,
+                        gallery_embs, args.output_dir, device)
+        if "koppen"      in fullset_requested:
+            _timed_full("koppen",      run_koppen, model, full_loader, gallery_coords,
+                        gallery_embs, args.output_dir, device, climate_codes=climate_codes,
+                        pred_classifier=_kc_for_pred)
+        if "zone_perf"   in fullset_requested:
+            _timed_full("zone_perf",   run_zone_perf, model, full_loader, gallery_coords,
+                        cfg.evaluation.thresholds_km, args.output_dir, device,
+                        climate_codes=climate_codes)
+        if "tsne"        in fullset_requested:
+            _timed_full("tsne",        run_tsne, model, full_loader, args.output_dir, device,
+                        n_samples=min(512, args.eval_subset), classifier=_kc_for_pred)
+
+    # ── Batch-level + train-requiring methods ─────────────────────────────────
     batch_requested = methods & BATCH_METHODS
-    if not batch_requested:
+    train_requested = methods & TRAIN_METHODS
+    if not batch_requested and not train_requested:
         return
 
+    # Sample a large pool so stratification has enough candidates in each group
+    n = args.num_samples
+    pool_size = max(n * 30, 300)
     torch.manual_seed(args.seed)
-    batch_loader = DataLoader(dataset, batch_size=args.num_samples * 2, shuffle=True)
-    images, true_coords = next(iter(batch_loader))
-    images      = images[:args.num_samples]
-    true_coords = true_coords[:args.num_samples]
+    pool_loader = DataLoader(dataset, batch_size=pool_size, shuffle=True)
+    pool_images, pool_coords = next(iter(pool_loader))
 
+    model.eval()
     with torch.no_grad():
-        img_embs = model.encode_image(images.to(device))
-        best_idx = (img_embs @ gallery_embs.to(device).T).argmax(dim=-1).cpu()
-    pred_coords = gallery_coords[best_idx]
-    distances   = haversine_distance(pred_coords, true_coords)
+        pool_embs = model.encode_image(pool_images.to(device))
+        pool_idx  = (pool_embs @ gallery_embs.to(device).T).argmax(dim=-1).cpu()
+    pool_pred = gallery_coords[pool_idx]
+    pool_dist = haversine_distance(pool_pred, pool_coords)
 
-    img_nps = [denormalize(images[i]) for i in range(args.num_samples)]
+    # Stratify: good < 200 km | mixed 200–2500 km | bad > 2500 km
+    def pick(mask, count):
+        idx = mask.nonzero().squeeze(1).tolist()
+        return idx[:count]
 
-    if "gradcam" in batch_requested:
-        run_gradcam(model, images, true_coords, img_nps, args.output_dir)
-    if "rollout" in batch_requested:
-        run_rollout(model, images, img_nps, args.output_dir)
-    if "ig" in batch_requested:
-        run_ig(model, images, true_coords, img_nps, args.output_dir, args.ig_steps)
-    if "layerwise" in batch_requested:
-        run_layerwise(model, images, true_coords, img_nps, args.output_dir)
-    if "heads" in batch_requested:
-        run_heads(model, images, img_nps, args.output_dir)
-    if "worldmap" in batch_requested:
-        run_worldmap(model, images, gallery_coords, gallery_embs,
-                     true_coords, pred_coords, distances, args.output_dir)
-    if "all_methods" in batch_requested:
-        run_all_methods(model, images, true_coords, img_nps,
-                        gallery_embs, gallery_coords, distances,
-                        args.output_dir, args.ig_steps)
-    if "good_vs_bad" in batch_requested:
-        run_good_vs_bad(model, images, true_coords, distances,
-                        args.output_dir, args.ig_steps)
-    if "topk" in batch_requested:
-        run_topk(model, images, true_coords, img_nps, gallery_coords, gallery_embs,
-                 distances, args.output_dir, args.topk)
+    groups = {
+        "good":  pick(pool_dist <  200,                          n),
+        "mixed": pick((pool_dist >= 200) & (pool_dist <= 2500),  n),
+        "bad":   pick(pool_dist >  2500,                         n),
+    }
+    print("[Visualize] Group sizes: " +
+          " | ".join(f"{k}={len(v)}" for k, v in groups.items()))
+
+    def _timed(label, fn, *a, **kw):
+        print(f"  → {label} ...", flush=True)
+        t0 = time.time()
+        fn(*a, **kw)
+        print(f"  ✓ {label} done ({time.time()-t0:.1f}s)", flush=True)
+
+    def run_batch_methods(images, true_coords, pred_coords, distances, out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+        img_nps = [denormalize(images[i]) for i in range(len(images))]
+        if "gradcam"     in batch_requested:
+            _timed("gradcam",     run_gradcam, model, images, true_coords, img_nps, out_dir)
+        if "rollout"     in batch_requested:
+            _timed("rollout",     run_rollout, model, images, img_nps, out_dir)
+        if "ig"          in batch_requested:
+            _timed("ig",          run_ig, model, images, true_coords, img_nps, out_dir, args.ig_steps)
+        if "layerwise"   in batch_requested:
+            _timed("layerwise",   run_layerwise, model, images, true_coords, img_nps, out_dir)
+        if "heads"       in batch_requested:
+            _timed("heads",       run_heads, model, images, img_nps, out_dir)
+        if "worldmap"    in batch_requested:
+            _timed("worldmap",    run_worldmap, model, images, gallery_coords, gallery_embs,
+                                  true_coords, pred_coords, distances, out_dir)
+        if "all_methods" in batch_requested:
+            _timed("all_methods", run_all_methods, model, images, true_coords, img_nps,
+                                  gallery_embs, gallery_coords, distances, out_dir, args.ig_steps)
+        if "topk"        in batch_requested:
+            _timed("topk",        run_topk, model, images, true_coords, img_nps, gallery_coords,
+                                  gallery_embs, distances, out_dir, args.topk)
+
+    for group_name, indices in groups.items():
+        if not indices:
+            print(f"[Visualize] No samples for group '{group_name}', skipping")
+            continue
+        g_images = pool_images[indices]
+        g_coords = pool_coords[indices]
+        g_pred   = pool_pred[indices]
+        g_dist   = pool_dist[indices]
+        out_dir  = os.path.join(args.output_dir, group_name)
+        print(f"\n[Visualize] ── {group_name.upper()} "
+              f"(errors: {g_dist.min():.0f}–{g_dist.max():.0f} km) ──")
+        run_batch_methods(g_images, g_coords, g_pred, g_dist, out_dir)
+
+    # good_vs_bad: compare good and bad groups side by side
+    if "good_vs_bad" in batch_requested and groups["good"] and groups["bad"]:
+        run_good_vs_bad(
+            model,
+            pool_images[groups["good"]], pool_coords[groups["good"]], pool_dist[groups["good"]],
+            pool_images[groups["bad"]],  pool_coords[groups["bad"]],  pool_dist[groups["bad"]],
+            args.output_dir, args.ig_steps,
+        )
+
+    # Contamination check: run only on the "good" group
+    if "contamination" in methods and groups["good"]:
+        if not args.train_zip_dir or not args.train_csv:
+            print("[Visualize] contamination: requires --train_zip_dir and --train_csv")
+        else:
+            good_idx   = groups["good"]
+            good_imgs  = pool_images[good_idx]
+            good_nps   = [denormalize(good_imgs[i]) for i in range(len(good_idx))]
+            print(f"\n[Visualize] ── CONTAMINATION CHECK ──", flush=True)
+            t0 = time.time()
+            run_contamination_check(
+                model, good_imgs, pool_coords[good_idx],
+                good_nps, pool_dist[good_idx],
+                args.train_zip_dir, args.train_csv,
+                args.output_dir, device,
+                n_train_samples=args.n_train_samples,
+            )
+            print(f"[Visualize] contamination done ({time.time()-t0:.1f}s)", flush=True)
 
 
 if __name__ == "__main__":

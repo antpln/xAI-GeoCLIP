@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import csv
+import glob
+import io
+import os
 import traceback
-from typing import Optional, Callable
+import zipfile
+from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -130,3 +135,126 @@ class OSV5MStreamingDataset(torch.utils.data.IterableDataset):
                 yield image, coords
             except Exception:
                 continue
+
+
+class LocalZipOSV5MDataset(Dataset):
+    """
+    Dataset that reads images from locally downloaded OSV-5M zip files.
+
+    Expects the OSV-5M zip archives in ``zip_dir`` (e.g. 00.zip … 09.zip)
+    and the corresponding CSV metadata file (train.csv / test.csv) at
+    ``csv_path``.  Only shards whose zip file is present are used.
+
+    Images inside each zip are stored as ``{shard:02d}/{image_id}.jpg``.
+    The CSV ``id`` column contains the numeric ``image_id`` that is used to
+    join with zip contents.
+
+    Multiprocessing-safe: zip file handles are opened lazily inside each
+    DataLoader worker and excluded from pickling.
+
+    Args:
+        zip_dir:  Directory containing the zip archives (e.g. ``images/train``).
+        csv_path: Path to the metadata CSV (e.g. ``/data/.../train.csv``).
+        transform: torchvision transform applied to PIL images.
+        shards:   Explicit list of shard indices to include (0-based).
+                  ``None`` uses all zip files found in ``zip_dir``.
+    """
+
+    def __init__(
+        self,
+        zip_dir: str,
+        csv_path: str,
+        transform: Optional[Callable] = None,
+        shards: Optional[List[int]] = None,
+    ):
+        self.zip_dir = zip_dir
+        self.transform = transform
+
+        # Discover available zip files
+        if shards is not None:
+            zip_paths = {
+                f"{s:02d}": os.path.join(zip_dir, f"{s:02d}.zip")
+                for s in shards
+            }
+            missing = [p for p in zip_paths.values() if not os.path.exists(p)]
+            if missing:
+                raise FileNotFoundError(f"Shard zip(s) not found: {missing}")
+        else:
+            found = sorted(glob.glob(os.path.join(zip_dir, "*.zip")))
+            zip_paths = {
+                os.path.splitext(os.path.basename(p))[0]: p for p in found
+            }
+
+        if not zip_paths:
+            raise FileNotFoundError(f"No zip files found in {zip_dir}")
+
+        print(f"[LocalZipDataset] Indexing {len(zip_paths)} shard(s): {sorted(zip_paths)}")
+
+        # Build image-id → (shard_key, path_in_zip) index from zip TOC
+        id_to_loc: Dict[str, Tuple[str, str]] = {}
+        for shard_key, zip_path in zip_paths.items():
+            with zipfile.ZipFile(zip_path) as zf:
+                for name in zf.namelist():
+                    if name.endswith(".jpg") or name.endswith(".jpeg"):
+                        stem = os.path.splitext(os.path.basename(name))[0]
+                        id_to_loc[stem] = (shard_key, name)
+
+        print(f"[LocalZipDataset] Indexed {len(id_to_loc):,} images from zips")
+
+        # Read CSV and join with zip index
+        samples: List[Tuple[str, str, float, float]] = []
+        with open(csv_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                img_id = str(int(float(row["id"])))  # normalise numeric id
+                if img_id not in id_to_loc:
+                    continue
+                shard_key, path_in_zip = id_to_loc[img_id]
+                lat = float(row["latitude"])
+                lon = float(row["longitude"])
+                try:
+                    climate = int(float(row.get("climate") or 0))
+                except (ValueError, TypeError):
+                    climate = 0
+                samples.append((shard_key, path_in_zip, lat, lon, climate))
+
+        print(f"[LocalZipDataset] {len(samples):,} matched samples after CSV join")
+        self.samples = samples
+        self._zip_paths = {k: v for k, v in zip_paths.items()}
+        self._zips: Dict[str, zipfile.ZipFile] = {}
+        # Climate codes from the CSV (integer 1-30, 0 = ocean/unknown)
+        self.climate_codes: List[int] = [s[4] for s in samples]
+
+    # ------------------------------------------------------------------
+    # Pickling support for DataLoader multiprocessing
+    # ------------------------------------------------------------------
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_zips"] = {}  # drop open file handles; will reopen in workers
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._zips = {}
+
+    # ------------------------------------------------------------------
+    # Dataset interface
+    # ------------------------------------------------------------------
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        shard_key, path_in_zip, lat, lon, *_ = self.samples[idx]
+        try:
+            if shard_key not in self._zips:
+                self._zips[shard_key] = zipfile.ZipFile(self._zip_paths[shard_key])
+            jpg_bytes = self._zips[shard_key].read(path_in_zip)
+            image = Image.open(io.BytesIO(jpg_bytes)).convert("RGB")
+            if self.transform is not None:
+                image = self.transform(image)
+            return image, torch.tensor([lat, lon], dtype=torch.float32)
+        except Exception:
+            traceback.print_exc()
+            return self.__getitem__((idx + 1) % len(self))

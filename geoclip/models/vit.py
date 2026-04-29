@@ -312,47 +312,42 @@ def load_clip_weights(vit: VisionTransformer, model_name: str) -> None:
     hf_model = _HFVision.from_pretrained(hf_id)
     hf_sd = hf_model.state_dict()
 
+    # Some transformers versions prefix keys with "vision_model.", others don't
+    p = "vision_model." if any(k.startswith("vision_model.") for k in hf_sd) else ""
+
     our_sd = vit.state_dict()
     mapping: Dict[str, str] = {}
 
-    # Patch embedding
-    mapping["vision_model.embeddings.patch_embedding.weight"] = "patch_embed.proj.weight"
-    mapping["vision_model.embeddings.patch_embedding.bias"]   = "patch_embed.proj.bias"
+    mapping[f"{p}embeddings.patch_embedding.weight"] = "patch_embed.proj.weight"
+    mapping[f"{p}embeddings.patch_embedding.bias"]   = "patch_embed.proj.bias"
+    mapping[f"{p}pre_layrnorm.weight"]               = "pre_norm.weight"
+    mapping[f"{p}pre_layrnorm.bias"]                 = "pre_norm.bias"
+    mapping[f"{p}post_layernorm.weight"]             = "post_norm.weight"
+    mapping[f"{p}post_layernorm.bias"]               = "post_norm.bias"
 
-    # Pre-norm
-    mapping["vision_model.pre_layrnorm.weight"] = "pre_norm.weight"
-    mapping["vision_model.pre_layrnorm.bias"]   = "pre_norm.bias"
-
-    # Post-norm
-    mapping["vision_model.post_layernorm.weight"] = "post_norm.weight"
-    mapping["vision_model.post_layernorm.bias"]   = "post_norm.bias"
-
-    # Transformer blocks
-    n = vit.num_layers
-    for i in range(n):
-        hf_pfx = f"vision_model.encoder.layers.{i}"
+    for i in range(vit.num_layers):
+        hf_pfx = f"{p}encoder.layers.{i}"
         our_pfx = f"blocks.{i}"
         for hf_k, our_k in [
-            ("layer_norm1.weight",      "norm1.weight"),
-            ("layer_norm1.bias",        "norm1.bias"),
-            ("self_attn.q_proj.weight", "attn.q_proj.weight"),
-            ("self_attn.q_proj.bias",   "attn.q_proj.bias"),
-            ("self_attn.k_proj.weight", "attn.k_proj.weight"),
-            ("self_attn.k_proj.bias",   "attn.k_proj.bias"),
-            ("self_attn.v_proj.weight", "attn.v_proj.weight"),
-            ("self_attn.v_proj.bias",   "attn.v_proj.bias"),
+            ("layer_norm1.weight",        "norm1.weight"),
+            ("layer_norm1.bias",          "norm1.bias"),
+            ("self_attn.q_proj.weight",   "attn.q_proj.weight"),
+            ("self_attn.q_proj.bias",     "attn.q_proj.bias"),
+            ("self_attn.k_proj.weight",   "attn.k_proj.weight"),
+            ("self_attn.k_proj.bias",     "attn.k_proj.bias"),
+            ("self_attn.v_proj.weight",   "attn.v_proj.weight"),
+            ("self_attn.v_proj.bias",     "attn.v_proj.bias"),
             ("self_attn.out_proj.weight", "attn.out_proj.weight"),
             ("self_attn.out_proj.bias",   "attn.out_proj.bias"),
-            ("layer_norm2.weight",      "norm2.weight"),
-            ("layer_norm2.bias",        "norm2.bias"),
-            ("mlp.fc1.weight",          "mlp.fc1.weight"),
-            ("mlp.fc1.bias",            "mlp.fc1.bias"),
-            ("mlp.fc2.weight",          "mlp.fc2.weight"),
-            ("mlp.fc2.bias",            "mlp.fc2.bias"),
+            ("layer_norm2.weight",        "norm2.weight"),
+            ("layer_norm2.bias",          "norm2.bias"),
+            ("mlp.fc1.weight",            "mlp.fc1.weight"),
+            ("mlp.fc1.bias",              "mlp.fc1.bias"),
+            ("mlp.fc2.weight",            "mlp.fc2.weight"),
+            ("mlp.fc2.bias",              "mlp.fc2.bias"),
         ]:
             mapping[f"{hf_pfx}.{hf_k}"] = f"{our_pfx}.{our_k}"
 
-    # Apply mapped weights
     loaded, skipped = 0, 0
     for hf_key, our_key in mapping.items():
         if hf_key not in hf_sd:
@@ -366,16 +361,13 @@ def load_clip_weights(vit: VisionTransformer, model_name: str) -> None:
         our_sd[our_key].copy_(hf_sd[hf_key])
         loaded += 1
 
-    # CLS token: HF stores as [hidden_dim], we store as [1, 1, hidden_dim]
-    cls_hf = hf_sd["vision_model.embeddings.class_embedding"]      # [D]
+    cls_hf = hf_sd[f"{p}embeddings.class_embedding"]
     our_sd["cls_token"].copy_(cls_hf.reshape(1, 1, -1))
 
-    # Positional embedding: HF stores as [num_positions, D], we store as [1, num_positions, D]
-    pos_hf = hf_sd["vision_model.embeddings.position_embedding.weight"]  # [num_pos, D]
+    pos_hf = hf_sd[f"{p}embeddings.position_embedding.weight"]
     our_sd["pos_embed"].copy_(pos_hf.unsqueeze(0))
 
     vit.load_state_dict(our_sd)
     print(f"[ViT] Loaded {loaded + 2} weight tensors, skipped {skipped}.")
 
-    # Free HF model memory
     del hf_model, hf_sd

@@ -8,6 +8,7 @@ model:
   embedding_dim: 512        # must match CLIP output dim
 
 data:
+  mode: "hf"                # hf | subset | streaming | sharded | local
   subset_size: 50000        # set to null for full dataset
   streaming: false
   num_workers: 4
