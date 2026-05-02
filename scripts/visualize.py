@@ -446,6 +446,18 @@ def run_koppen(model, val_loader, gallery_coords, gallery_embs, out_dir, device,
     n_tot = len(coherence)
     print(f"Climate-coherent: {n_coh}/{n_tot} ({100*n_coh/max(n_tot,1):.0f}%)")
     print(f"Spurious (distant): {coherence.count('distant')}/{n_tot}")
+    return {
+        "n_total":   n_tot,
+        "exact":     coherence.count("exact"),
+        "adjacent":  coherence.count("adjacent"),
+        "distant":   coherence.count("distant"),
+        "ocean":     coherence.count("ocean"),
+        "coherent_pct": 100 * n_coh / max(n_tot, 1),
+        "confusion": {
+            groups_order[r]: {groups_order[c]: int(conf[r, c]) for c in range(n_g)}
+            for r in range(n_g)
+        },
+    }
 
 
 def run_error_dist(model, val_loader, gallery_coords, gallery_embs, thresholds_km, out_dir, device):
@@ -496,6 +508,16 @@ def run_error_dist(model, val_loader, gallery_coords, gallery_embs, thresholds_k
     print(f"[Visualize] Saved {path}")
     print(f"Mean: {all_dists.mean():.0f} km | Median: {all_dists.median():.0f} km "
           f"| 90th p: {torch.quantile(all_dists, 0.9):.0f} km")
+    return {
+        "n_samples":  len(all_dists),
+        "mean_km":    all_dists.mean().item(),
+        "median_km":  all_dists.median().item(),
+        "p10_km":     torch.quantile(all_dists, 0.10).item(),
+        "p90_km":     torch.quantile(all_dists, 0.90).item(),
+        "p95_km":     torch.quantile(all_dists, 0.95).item(),
+        **{f"recall@{t}km": (all_dists <= t).float().mean().item()
+           for t in thresholds_km},
+    }
 
 
 def run_tsne(model, val_loader, out_dir, device, n_samples=512, classifier=None):
@@ -599,6 +621,11 @@ def run_calibration(model, val_loader, gallery_coords, gallery_embs, out_dir, de
     plt.close()
     print(f"[Visualize] Saved {path}")
     print(f"Pearson r (sim, error) = {r:.3f}")
+    return {
+        "pearson_r":    r,
+        "sim_range":    (float(cal_sims.min()), float(cal_sims.max())),
+        "per_decile":   list(zip([float(p) for p in pct_mid], [float(e) for e in med_err])),
+    }
 
 
 def run_zone_perf(model, val_loader, gallery_coords, thresholds_km, out_dir, device,
@@ -653,6 +680,7 @@ def run_zone_perf(model, val_loader, gallery_coords, thresholds_km, out_dir, dev
     plt.savefig(path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"[Visualize] Saved {path}")
+    return {"zones": zone_metrics}
 
 
 def run_training_curves(checkpoint_dir, out_dir):
@@ -736,6 +764,97 @@ def run_training_curves(checkpoint_dir, out_dir):
     plt.close()
     print(f"[Visualize] Saved {path}")
     print(f"Best median GCD: {min(median_gcd):.0f} km  (epoch {best_epoch})")
+
+
+# ---------------------------------------------------------------------------
+# Text report
+# ---------------------------------------------------------------------------
+
+def write_report(out_dir: str, args, stats: dict) -> None:
+    """Write a markdown summary report of all computed stats."""
+    lines = []
+    add = lines.append
+
+    add("# GeoCLIP Evaluation Report\n")
+    add(f"**Checkpoint**: `{args.checkpoint}`  ")
+    add(f"**Eval set**: `{args.eval_csv}`  ")
+    add(f"**Eval subset**: {args.eval_subset:,} samples\n")
+
+    if "error_dist" in stats:
+        s = stats["error_dist"]
+        add("## Overall Error\n")
+        add(f"| Metric | Value |")
+        add(f"|--------|-------|")
+        add(f"| Samples evaluated | {s['n_samples']:,} |")
+        add(f"| Mean GCD | {s['mean_km']:.0f} km |")
+        add(f"| Median GCD | {s['median_km']:.0f} km |")
+        add(f"| 10th percentile | {s['p10_km']:.0f} km |")
+        add(f"| 90th percentile | {s['p90_km']:.0f} km |")
+        add(f"| 95th percentile | {s['p95_km']:.0f} km |")
+        add("")
+        add("### Recall @ thresholds\n")
+        add("| Threshold | Recall |")
+        add("|-----------|--------|")
+        for k, v in s.items():
+            if k.startswith("recall@"):
+                add(f"| {k.replace('recall@', '')} | {v*100:.2f}% |")
+        add("")
+
+    if "calibration" in stats:
+        s = stats["calibration"]
+        add("## Calibration\n")
+        add(f"**Pearson r** (confidence vs error): **{s['pearson_r']:.3f}**  ")
+        add(f"Similarity range: [{s['sim_range'][0]:.3f}, {s['sim_range'][1]:.3f}]\n")
+        add("### Median error per confidence decile\n")
+        add("| Decile mid-sim | Median error (km) |")
+        add("|----------------|-------------------|")
+        for sim, err in s["per_decile"]:
+            add(f"| {sim:.3f} | {err:.0f} |")
+        add("")
+
+    if "koppen" in stats:
+        s = stats["koppen"]
+        n = s["n_total"]
+        add("## Köppen Climate Coherence\n")
+        add(f"| Category | Count | % |")
+        add(f"|----------|-------|---|")
+        for cat in ["exact", "adjacent", "distant", "ocean"]:
+            cnt = s[cat]
+            add(f"| {cat.capitalize()} | {cnt} | {100*cnt/max(n,1):.1f}% |")
+        add(f"\n**Climate-coherent** (exact + adjacent): "
+            f"**{s['coherent_pct']:.1f}%**\n")
+        add("### Confusion matrix (true → predicted major group)\n")
+        groups = [g for g in s["confusion"] if g != "?"]
+        add("| True \\ Pred | " + " | ".join(groups + ["?"]) + " |")
+        add("|" + "---|" * (len(groups) + 2))
+        for tg in groups + ["?"]:
+            row = s["confusion"].get(tg, {})
+            vals = " | ".join(str(row.get(pg, 0)) for pg in groups + ["?"])
+            add(f"| **{tg}** | {vals} |")
+        add("")
+
+    if "zone_perf" in stats:
+        s = stats["zone_perf"]["zones"]
+        add("## Per-Zone Performance\n")
+        sorted_zones = sorted(s, key=lambda g: -s[g]["count"])
+        recall_keys = sorted(
+            [k for k in next(iter(s.values())) if k.startswith("recall@")],
+            key=lambda k: int(k.replace("recall@", "").replace("km", ""))
+        )
+        header = "| Zone | Name | n | Median GCD | " + " | ".join(recall_keys) + " |"
+        sep    = "|------|------|---|------------|" + "---|" * len(recall_keys)
+        add(header); add(sep)
+        for g in sorted_zones:
+            m = s[g]
+            recalls = " | ".join(f"{m.get(k, 0)*100:.1f}%" for k in recall_keys)
+            add(f"| {g} | {KOPPEN_GROUPS.get(g, 'Ocean/Unk')} | {m['count']} "
+                f"| {m['median_gcd_km']:.0f} km | {recalls} |")
+        add("")
+
+    path = os.path.join(out_dir, "report.md")
+    with open(path, "w") as f:
+        f.write("\n".join(lines))
+    print(f"[Visualize] Report saved to {path}")
 
 
 # ---------------------------------------------------------------------------
@@ -974,26 +1093,40 @@ def main():
         def _timed_full(label, fn, *a, **kw):
             print(f"\n[Visualize] ── {label.upper()} ──", flush=True)
             t0 = time.time()
-            fn(*a, **kw)
+            result = fn(*a, **kw)
             print(f"[Visualize] {label} done ({time.time()-t0:.1f}s)", flush=True)
+            return result
+
+        report_stats = {}
 
         if "error_dist"  in fullset_requested:
-            _timed_full("error_dist",  run_error_dist, model, full_loader, gallery_coords,
-                        gallery_embs, cfg.evaluation.thresholds_km, args.output_dir, device)
+            report_stats["error_dist"] = _timed_full(
+                "error_dist", run_error_dist, model, full_loader, gallery_coords,
+                gallery_embs, cfg.evaluation.thresholds_km, args.output_dir, device)
+
         if "calibration" in fullset_requested:
-            _timed_full("calibration", run_calibration, model, full_loader, gallery_coords,
-                        gallery_embs, args.output_dir, device)
+            report_stats["calibration"] = _timed_full(
+                "calibration", run_calibration, model, full_loader, gallery_coords,
+                gallery_embs, args.output_dir, device)
+
         if "koppen"      in fullset_requested:
-            _timed_full("koppen",      run_koppen, model, full_loader, gallery_coords,
-                        gallery_embs, args.output_dir, device, climate_codes=climate_codes,
-                        pred_classifier=_kc_for_pred)
+            report_stats["koppen"] = _timed_full(
+                "koppen", run_koppen, model, full_loader, gallery_coords,
+                gallery_embs, args.output_dir, device, climate_codes=climate_codes,
+                pred_classifier=_kc_for_pred)
+
         if "zone_perf"   in fullset_requested:
-            _timed_full("zone_perf",   run_zone_perf, model, full_loader, gallery_coords,
-                        cfg.evaluation.thresholds_km, args.output_dir, device,
-                        climate_codes=climate_codes)
+            report_stats["zone_perf"] = _timed_full(
+                "zone_perf", run_zone_perf, model, full_loader, gallery_coords,
+                cfg.evaluation.thresholds_km, args.output_dir, device,
+                climate_codes=climate_codes)
+
         if "tsne"        in fullset_requested:
-            _timed_full("tsne",        run_tsne, model, full_loader, args.output_dir, device,
+            _timed_full("tsne", run_tsne, model, full_loader, args.output_dir, device,
                         n_samples=min(512, args.eval_subset), classifier=_kc_for_pred)
+
+        if report_stats:
+            write_report(args.output_dir, args, report_stats)
 
     # ── Batch-level + train-requiring methods ─────────────────────────────────
     batch_requested = methods & BATCH_METHODS

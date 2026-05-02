@@ -111,20 +111,18 @@ class PerHeadAttention:
         grid_size = int(n_patches ** 0.5)
         H_img, W_img = images.shape[-2:]
 
+        # Entropy on raw patch attention (before upsampling)
+        entropy = -(cls_attn * (cls_attn + 1e-8).log()).sum(dim=-1)  # [B, H]
+        order   = entropy.mean(dim=0).argsort()                       # ascending: focused first
+
+        # Upsample to image resolution
         cls_attn = cls_attn.reshape(B * num_heads, 1, grid_size, grid_size)
         cls_attn = F.interpolate(cls_attn, size=(H_img, W_img), mode="bilinear", align_corners=False)
         cls_attn = cls_attn.reshape(B, num_heads, H_img, W_img)
 
-        # Normalize each (sample, head) pair independently
         flat  = cls_attn.reshape(B, num_heads, -1)
         h_min = flat.min(dim=-1).values[:, :, None, None]
         h_max = flat.max(dim=-1).values[:, :, None, None]
         maps  = (cls_attn - h_min) / (h_max - h_min + 1e-8)
 
-        # Sort heads by entropy (averaged across the batch): most focused first.
-        # High-entropy heads attend broadly (uninformative); low-entropy heads
-        # are concentrated on specific patches (most interpretable).
-        probs   = flat / (flat.sum(dim=-1, keepdim=True) + 1e-8)   # [B, H, N]
-        entropy = -(probs * (probs + 1e-8).log()).sum(dim=-1)       # [B, H]
-        order   = entropy.mean(dim=0).argsort()                     # [H] ascending
         return maps[:, order].cpu()
